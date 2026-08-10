@@ -1,0 +1,374 @@
+From 72113635ee69f5d28eb92abd8f8fe936a3b9ccae Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:33:37 +0300
+Subject: [PATCH 07/13] Notify about updates without ever installing them
+
+The upstream updater stays compiled out: its feed serves official Telegram
+Desktop packages, and taking one would overwrite this binary with a build
+that has none of the hardening.
+
+This notifier only reads. It verifies an Ed25519 signature over the release
+metadata against a key compiled in, rejects non-HTTPS URLs and oversized or
+slow responses, and at most opens the download link in a browser. It never
+downloads or executes code itself.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Telegram/SourceFiles/core/update_feed.cpp | 302 ++++++++++++++++++++++
+ Telegram/SourceFiles/core/update_feed.h   |  35 +++
+ 2 files changed, 337 insertions(+)
+ create mode 100644 Telegram/SourceFiles/core/update_feed.cpp
+ create mode 100644 Telegram/SourceFiles/core/update_feed.h
+
+diff --git a/Telegram/SourceFiles/core/update_feed.cpp b/Telegram/SourceFiles/core/update_feed.cpp
+new file mode 100644
+index 0000000..dec5b9f
+--- /dev/null
++++ b/Telegram/SourceFiles/core/update_feed.cpp
+@@ -0,0 +1,302 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "core/update_feed.h"
++
++#include "base/openssl_help.h"
++#include "base/unixtime.h"
++#include "logs.h"
++#include "settings.h"
++
++#include <QtCore/QFile>
++#include <QtCore/QJsonDocument>
++#include <QtCore/QJsonObject>
++#include <QtCore/QSaveFile>
++#include <QtCore/QUrl>
++#include <QtNetwork/QNetworkAccessManager>
++#include <QtNetwork/QNetworkReply>
++#include <QtNetwork/QNetworkRequest>
++
++#include <openssl/evp.h>
++
++#include <cmath>
++
++namespace Core {
++namespace {
++
++constexpr auto kFeedUrl = "https://sealgram-updates.vercel.app/api/update";
++constexpr auto kMaxResponseBytes = 32 * 1024;
++constexpr auto kTimeoutMs = 15 * 1000;
++constexpr auto kPostponeFor = 24 * 60 * 60;
++constexpr auto kMaxSafeJsonInteger = 9007199254740991.;
++
++constexpr unsigned char kFeedPublicKey[32] = {
++	0x06, 0x85, 0x0c, 0xba, 0xef, 0x0a, 0x33, 0x5e,
++	0x03, 0x87, 0xd9, 0x22, 0xc6, 0x1a, 0x44, 0x31,
++	0xc0, 0x8c, 0x70, 0x8b, 0x1b, 0x99, 0x3e, 0x1c,
++	0xff, 0x4c, 0x35, 0x97, 0x31, 0x10, 0xb0, 0x35,
++};
++
++struct UpdatePromptState {
++	uint64 version = 0;
++	TimeId remindAfter = 0;
++};
++
++[[nodiscard]] QString StateFilePath() {
++	return cWorkingDir() + u"tdata/update_feed"_q;
++}
++
++[[nodiscard]] bool IsHttpsUrl(const QString &value) {
++	const auto url = QUrl(value, QUrl::StrictMode);
++	return url.isValid()
++		&& (url.scheme().compare(u"https"_q, Qt::CaseInsensitive) == 0)
++		&& !url.host().isEmpty()
++		&& url.userInfo().isEmpty()
++		&& !url.hasFragment();
++}
++
++[[nodiscard]] bool IsSha256(const QString &value) {
++	if (value.size() != 64) {
++		return false;
++	}
++	for (const auto character : value) {
++		if (!character.isDigit()
++			&& (character < u'a' || character > u'f')
++			&& (character < u'A' || character > u'F')) {
++			return false;
++		}
++	}
++	return true;
++}
++
++[[nodiscard]] std::optional<uint64> ParseVersion(
++		const QJsonValue &value) {
++	if (!value.isDouble()) {
++		return std::nullopt;
++	}
++	const auto number = value.toDouble();
++	if (number <= 0.
++		|| number > kMaxSafeJsonInteger
++		|| number != std::floor(number)) {
++		return std::nullopt;
++	}
++	return uint64(number);
++}
++
++[[nodiscard]] UpdatePromptState LoadPromptState() {
++	auto file = QFile(StateFilePath());
++	if (!file.open(QIODevice::ReadOnly)) {
++		return {};
++	}
++	const auto document = QJsonDocument::fromJson(file.readAll());
++	if (!document.isObject()) {
++		return {};
++	}
++	const auto object = document.object();
++	const auto version = ParseVersion(object.value("version"));
++	const auto remindAfter = object.value("remind_after");
++	if (!version || !remindAfter.isDouble()) {
++		return {};
++	}
++	return {
++		.version = *version,
++		.remindAfter = TimeId(remindAfter.toDouble()),
++	};
++}
++
++} // namespace
++
++bool VerifyUpdateFeedSignature(
++		const QByteArray &payload,
++		const QByteArray &signature) {
++	if (payload.isEmpty() || signature.size() != 64) {
++		return false;
++	}
++
++	const auto key = EVP_PKEY_new_raw_public_key(
++		EVP_PKEY_ED25519,
++		nullptr,
++		kFeedPublicKey,
++		sizeof(kFeedPublicKey));
++	if (!key) {
++		return false;
++	}
++	const auto keyGuard = gsl::finally([&] { EVP_PKEY_free(key); });
++
++	const auto context = EVP_MD_CTX_new();
++	if (!context) {
++		return false;
++	}
++	const auto contextGuard = gsl::finally([&] { EVP_MD_CTX_free(context); });
++
++	if (EVP_DigestVerifyInit(context, nullptr, nullptr, nullptr, key) != 1) {
++		return false;
++	}
++	return EVP_DigestVerify(
++		context,
++		reinterpret_cast<const unsigned char*>(signature.constData()),
++		size_t(signature.size()),
++		reinterpret_cast<const unsigned char*>(payload.constData()),
++		size_t(payload.size())) == 1;
++}
++
++std::optional<UpdateFeedResult> ParseUpdateFeedPayload(
++		const QByteArray &payload) {
++	auto error = QJsonParseError();
++	const auto document = QJsonDocument::fromJson(payload, &error);
++	if (error.error != QJsonParseError::NoError || !document.isObject()) {
++		return std::nullopt;
++	}
++	const auto object = document.object();
++	if (object.value("schema").toInt() != 1
++		|| !object.value("available").isBool()) {
++		return std::nullopt;
++	}
++	const auto version = ParseVersion(object.value("version"));
++	if (!version) {
++		return std::nullopt;
++	}
++	for (const auto &name : {
++			"display_version",
++			"installer_url",
++			"source_url",
++			"sha256",
++			"notes",
++		}) {
++		if (!object.value(name).isString()) {
++			return std::nullopt;
++		}
++	}
++
++	auto result = UpdateFeedResult{
++		.available = object.value("available").toBool(),
++		.version = *version,
++		.displayVersion = object.value("display_version").toString(),
++		.installerUrl = object.value("installer_url").toString(),
++		.sourceUrl = object.value("source_url").toString(),
++		.sha256 = object.value("sha256").toString(),
++		.notes = object.value("notes").toString(),
++	};
++	if (result.displayVersion.isEmpty()
++		|| result.displayVersion.size() > 32
++		|| result.notes.size() > 2000) {
++		return std::nullopt;
++	}
++	if (!result.available) {
++		if (!result.installerUrl.isEmpty()
++			|| !result.sourceUrl.isEmpty()
++			|| !result.sha256.isEmpty()
++			|| !result.notes.isEmpty()) {
++			return std::nullopt;
++		}
++		return result;
++	}
++	if (!IsHttpsUrl(result.installerUrl)
++		|| !IsHttpsUrl(result.sourceUrl)
++		|| !IsSha256(result.sha256)) {
++		return std::nullopt;
++	}
++	return result;
++}
++
++bool ShouldShowUpdate(uint64 version) {
++	const auto state = LoadPromptState();
++	return state.version != version
++		|| state.remindAfter <= base::unixtime::now();
++}
++
++void PostponeUpdate(uint64 version) {
++	auto object = QJsonObject();
++	object.insert("version", double(version));
++	object.insert(
++		"remind_after",
++		double(base::unixtime::now() + kPostponeFor));
++
++	auto file = QSaveFile(StateFilePath());
++	if (!file.open(QIODevice::WriteOnly)
++		|| file.write(QJsonDocument(object).toJson(
++			QJsonDocument::Compact)) < 0
++		|| !file.commit()) {
++		LOG(("Update feed: could not save prompt state."));
++	}
++}
++
++void RequestUpdateFeed(
++		Fn<void(std::optional<UpdateFeedResult>)> done) {
++	const auto manager = new QNetworkAccessManager();
++
++	auto request = QNetworkRequest(QUrl(kFeedUrl));
++	request.setTransferTimeout(kTimeoutMs);
++	request.setAttribute(
++		QNetworkRequest::RedirectPolicyAttribute,
++		QNetworkRequest::NoLessSafeRedirectPolicy);
++
++	const auto reply = manager->get(request);
++	QObject::connect(
++		reply,
++		&QNetworkReply::downloadProgress,
++		[=](qint64 received, qint64) {
++			if (received > kMaxResponseBytes) {
++				reply->abort();
++			}
++		});
++	QObject::connect(reply, &QNetworkReply::finished, [=] {
++		const auto guard = gsl::finally([&] {
++			reply->deleteLater();
++			manager->deleteLater();
++		});
++
++		if (reply->error() != QNetworkReply::NoError) {
++			LOG(("Update feed: request failed: %1").arg(
++				reply->errorString()));
++			done(std::nullopt);
++			return;
++		}
++		const auto body = reply->readAll();
++		if (body.size() > kMaxResponseBytes) {
++			LOG(("Update feed: response too large."));
++			done(std::nullopt);
++			return;
++		}
++
++		auto error = QJsonParseError();
++		const auto document = QJsonDocument::fromJson(body, &error);
++		if (error.error != QJsonParseError::NoError
++			|| !document.isObject()) {
++			LOG(("Update feed: response is not JSON."));
++			done(std::nullopt);
++			return;
++		}
++		const auto object = document.object();
++		if (!object.value("payload").isString()
++			|| !object.value("signature").isString()) {
++			LOG(("Update feed: response envelope is invalid."));
++			done(std::nullopt);
++			return;
++		}
++		const auto payload = object.value("payload").toString().toUtf8();
++		const auto signature = QByteArray::fromBase64(
++			object.value("signature").toString().toUtf8(),
++			QByteArray::Base64UrlEncoding
++				| QByteArray::AbortOnBase64DecodingErrors);
++		if (!VerifyUpdateFeedSignature(payload, signature)) {
++			LOG(("Update feed: SIGNATURE INVALID, response discarded."));
++			done(std::nullopt);
++			return;
++		}
++		const auto result = ParseUpdateFeedPayload(payload);
++		if (!result) {
++			LOG(("Update feed: signed payload is invalid."));
++			done(std::nullopt);
++			return;
++		}
++		LOG(("Update feed: version %1 accepted.").arg(result->version));
++		done(result);
++	});
++}
++
++} // namespace Core
+diff --git a/Telegram/SourceFiles/core/update_feed.h b/Telegram/SourceFiles/core/update_feed.h
+new file mode 100644
+index 0000000..2b19a21
+--- /dev/null
++++ b/Telegram/SourceFiles/core/update_feed.h
+@@ -0,0 +1,35 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include <optional>
++
++namespace Core {
++
++struct UpdateFeedResult {
++	bool available = false;
++	uint64 version = 0;
++	QString displayVersion;
++	QString installerUrl;
++	QString sourceUrl;
++	QString sha256;
++	QString notes;
++};
++
++void RequestUpdateFeed(Fn<void(std::optional<UpdateFeedResult>)> done);
++
++[[nodiscard]] bool VerifyUpdateFeedSignature(
++	const QByteArray &payload,
++	const QByteArray &signature);
++[[nodiscard]] std::optional<UpdateFeedResult> ParseUpdateFeedPayload(
++	const QByteArray &payload);
++
++[[nodiscard]] bool ShouldShowUpdate(uint64 version);
++void PostponeUpdate(uint64 version);
++
++} // namespace Core
+-- 
+2.54.0.windows.1
+

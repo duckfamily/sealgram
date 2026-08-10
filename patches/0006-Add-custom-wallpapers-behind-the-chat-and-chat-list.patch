@@ -1,0 +1,617 @@
+From 77f933cd8a7ce9db5bacaf1e92ecfa09c962589e Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:33:21 +0300
+Subject: [PATCH 06/13] Add custom wallpapers behind the chat and chat list
+
+One cover-scaled frame painted in top-level-window coordinates, so the two
+columns form a single continuous surface.
+
+Animated files are decoded with FFmpeg::FrameGenerator, not
+Media::Clip::Reader. The clip reader caps decoding at 1280x720 and sets that
+as max_pixels before avcodec_open2, so any ordinary 1080p file made the codec
+refuse to open with EINVAL and no frame ever appeared. That limit is right
+for inline previews inside a chat and wrong for a full-screen wallpaper.
+
+The clip reader could not report the failure either: Manager
+handleProcessResult posts the error notification to the main thread and then
+erases the reader from its own map before that post runs, so the carries()
+check drops it. A file that cannot be opened looks exactly like one that was
+never processed.
+
+Frames are decoded at the window's own size and blitted without a transform.
+Scaling them down on every paint, from both the chat list and the chat, was
+what made an animated wallpaper stutter; this also removes a second
+resampling pass, so the picture is sharper as well as cheaper.
+
+Every failure path logs. The feature originally had no diagnostics at all,
+which is why nobody could tell the decoder was rejecting the file.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../SourceFiles/core/sealgram_wallpaper.cpp   | 392 ++++++++++++++++++
+ .../SourceFiles/core/sealgram_wallpaper.h     |  47 +++
+ .../dialogs/dialogs_inner_widget.cpp          |  11 +-
+ .../SourceFiles/dialogs/dialogs_widget.cpp    |  17 +-
+ .../SourceFiles/window/section_widget.cpp     |   8 +
+ 5 files changed, 470 insertions(+), 5 deletions(-)
+ create mode 100644 Telegram/SourceFiles/core/sealgram_wallpaper.cpp
+ create mode 100644 Telegram/SourceFiles/core/sealgram_wallpaper.h
+
+diff --git a/Telegram/SourceFiles/core/sealgram_wallpaper.cpp b/Telegram/SourceFiles/core/sealgram_wallpaper.cpp
+new file mode 100644
+index 0000000..0ccf4b8
+--- /dev/null
++++ b/Telegram/SourceFiles/core/sealgram_wallpaper.cpp
+@@ -0,0 +1,392 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "core/sealgram_wallpaper.h"
++
++#include "base/timer.h"
++#include "base/unixtime.h"
++#include "ffmpeg/ffmpeg_frame_generator.h"
++#include "media/clip/media_clip_reader.h"
++#include "ui/chat/attach/attach_prepare.h"
++#include "logs.h"
++#include "settings.h"
++#include "ui/painter.h"
++#include "ui/style/style_core_scale.h"
++
++#include <QtCore/QFile>
++#include <QtCore/QJsonDocument>
++#include <QtCore/QJsonObject>
++#include <QtCore/QSaveFile>
++#include <QtGui/QGuiApplication>
++#include <QtGui/QImageReader>
++#include <QtWidgets/QApplication>
++#include <QtWidgets/QWidget>
++
++namespace Sealgram {
++namespace {
++
++[[nodiscard]] QString StatePath() {
++	return cWorkingDir() + u"tdata/sealgram_wallpaper"_q;
++}
++
++[[nodiscard]] QString ReadStoredPath() {
++	auto file = QFile(StatePath());
++	if (!file.open(QIODevice::ReadOnly)) {
++		return {};
++	}
++	const auto document = QJsonDocument::fromJson(file.readAll());
++	return document.isObject()
++		? document.object().value("path").toString()
++		: QString();
++}
++
++void WriteStoredPath(const QString &path) {
++	auto file = QSaveFile(StatePath());
++	if (!file.open(QIODevice::WriteOnly)) {
++		return;
++	}
++	auto object = QJsonObject();
++	object.insert("version", 1);
++	object.insert("path", path);
++	file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
++	file.commit();
++}
++
++[[nodiscard]] bool IsAnimatedPath(const QString &path) {
++	return path.endsWith(u".gif"_q, Qt::CaseInsensitive)
++		|| path.endsWith(u".mp4"_q, Qt::CaseInsensitive)
++		|| path.endsWith(u".m4v"_q, Qt::CaseInsensitive)
++		|| path.endsWith(u".mov"_q, Qt::CaseInsensitive)
++		|| path.endsWith(u".webm"_q, Qt::CaseInsensitive);
++}
++
++void UpdateWindows() {
++	for (const auto widget : QApplication::topLevelWidgets()) {
++		// Hidden windows would repaint the moment they are shown anyway, and at
++		// animation rate the difference is a whole window's worth of work per
++		// frame per window.
++		if (widget->isVisible()) {
++			widget->update();
++		}
++	}
++}
++
++} // namespace
++
++// Animated wallpapers are decoded with FFmpeg::FrameGenerator rather than with
++// Media::Clip::Reader, which is what this originally used.
++//
++// The clip reader caps decoding at kMaxInlineArea, 1280x720, and sets that as
++// max_pixels before avcodec_open2. Anything larger makes the codec refuse to
++// open with EINVAL, so an ordinary 1080p GIF or video simply never produced a
++// frame. That limit is right for its own purpose - inline previews in a chat -
++// and wrong for a full-screen wallpaper. FrameGenerator allows 1920x1080x4.
++//
++// The clip reader's failure was also invisible: Manager::handleProcessResult
++// posts the error notification to the main thread and then erases the reader
++// from its own map before that post runs, so SafeCallback's carries() check
++// fails and the notification is dropped. A file that cannot be opened looks
++// exactly like one that was never processed.
++
++// Ceiling on how much of a file is read into memory. FrameGenerator decodes from
++// bytes, so a wallpaper is held in RAM for as long as it is set.
++constexpr auto kMaxAnimatedBytes = 64 * 1024 * 1024;
++
++// Used when the file does not declare a frame rate.
++constexpr auto kDefaultFrameRate = 25.;
++
++class WindowWallpaper::Private final {
++public:
++	explicit Private(WindowWallpaper *owner)
++	: owner(owner)
++	, animation([=] { advance(); }) {
++	}
++
++	// Physical pixels the next frame should be decoded at, so that painting is a
++	// straight blit.
++	//
++	// FrameGenerator only ever letterboxes: it scales the frame to fit inside
++	// the size asked for and centres it, and asserts that the frame is not
++	// larger than the request. Qt::KeepAspectRatioByExpanding therefore crashes
++	// it outright - the offsets go negative and it writes outside the storage.
++	// It survived the first test only because a 1920x1080 file was being asked
++	// for at 2560x1440, the same 16:9, so nothing had to be cropped.
++	//
++	// So cover is computed here instead, and the generator is asked for that
++	// exact size with IgnoreAspectRatio. It scales precisely to the request,
++	// which crops nothing and distorts nothing, because the size already
++	// carries the source's aspect ratio.
++	[[nodiscard]] QSize decodeSize() const {
++		const auto fallback = QSize(1280, 720);
++		if (windowSize.isEmpty()) {
++			return sourceSize.isEmpty() ? fallback : sourceSize;
++		}
++		const auto target = windowSize * ratio;
++		if (sourceSize.isEmpty()) {
++			return target;
++		}
++		const auto scale = std::max(
++			target.width() / double(sourceSize.width()),
++			target.height() / double(sourceSize.height()));
++		return QSize(
++			std::max(1, int(std::ceil(sourceSize.width() * scale))),
++			std::max(1, int(std::ceil(sourceSize.height() * scale))));
++	}
++
++	void advance() {
++		if (!generator) {
++			return;
++		}
++		auto rendered = generator->renderNext(
++			base::take(frame),
++			decodeSize(),
++			Qt::IgnoreAspectRatio);
++		if (rendered.image.isNull()) {
++			LOG(("Wallpaper: decoding stopped, no more frames."));
++			generator = nullptr;
++			animation.cancel();
++			return;
++		}
++		const auto first = !reportedFirstFrame;
++		frame = std::move(rendered.image);
++		display = QImage();
++		if (first) {
++			reportedFirstFrame = true;
++			LOG(("Wallpaper: first frame %1x%2."
++				).arg(frame.width()).arg(frame.height()));
++		}
++		if (rendered.last) {
++			generator->jumpToStart();
++		}
++		const auto wait = rendered.duration > 0
++			? rendered.duration
++			: crl::time(std::max(1000. / frameRate, 1.));
++		animation.callOnce(wait);
++		UpdateWindows();
++	}
++
++	// The image actually blitted: already cover-scaled to the window and
++	// carrying the device pixel ratio, so drawImage does no resampling at all.
++	//
++	// This used to scale the full frame down on every single paint, with smooth
++	// transform, from both the chat list and the chat - three times a frame at
++	// animation rate. That, not decoding, was what made an animated wallpaper
++	// stutter.
++	[[nodiscard]] const QImage &displayFor(QSize size, int pixelRatio) {
++		if ((size != windowSize) || (pixelRatio != ratio)) {
++			windowSize = size;
++			ratio = pixelRatio;
++			display = QImage();
++		}
++		if (!display.isNull() || frame.isNull()) {
++			return display;
++		}
++		const auto target = decodeSize();
++		display = (frame.size() == target)
++			? frame
++			: frame.scaled(
++				target,
++				Qt::KeepAspectRatioByExpanding,
++				Qt::SmoothTransformation);
++		display.setDevicePixelRatio(ratio);
++		return display;
++	}
++
++	void load(const QString &path) {
++		generator = nullptr;
++		frame = QImage();
++		display = QImage();
++		sourceSize = QSize();
++		animation.cancel();
++		reportedFirstFrame = false;
++		if (path.isEmpty() || !QFile::exists(path)) {
++			LOG(("Wallpaper: no file at '%1'.").arg(path));
++			return;
++		}
++		if (!IsAnimatedPath(path)) {
++			auto imageReader = QImageReader(path);
++			imageReader.setAutoTransform(true);
++			frame = imageReader.read();
++			if (frame.isNull()) {
++				LOG(("Wallpaper: could not decode '%1': %2."
++					).arg(path, imageReader.errorString()));
++			} else {
++				LOG(("Wallpaper: still image %1x%2 loaded."
++					).arg(frame.width()).arg(frame.height()));
++			}
++			return;
++		}
++		currentPath = path;
++
++		auto file = QFile(path);
++		if (!file.open(QIODevice::ReadOnly)) {
++			LOG(("Wallpaper: could not open '%1'.").arg(path));
++			return;
++		} else if (file.size() > kMaxAnimatedBytes) {
++			LOG(("Wallpaper: '%1' is %2 MB, too large to keep in memory."
++				).arg(path).arg(file.size() / (1024 * 1024)));
++			return;
++		}
++		const auto bytes = file.readAll();
++		if (bytes.isEmpty()) {
++			LOG(("Wallpaper: '%1' read as empty.").arg(path));
++			return;
++		}
++
++		// Needed before the first frame, to know what a cover-sized request
++		// looks like. QImageReader answers for GIF; for video the clip reader's
++		// inspection pass decodes one frame and its size gives the same answer.
++		sourceSize = QImageReader(path).size();
++		if (sourceSize.isEmpty()) {
++			const auto info = Media::Clip::PrepareForSending(path, bytes);
++			if (const auto video = std::get_if<Ui::PreparedFileInformation::Video>(
++					&info.media)) {
++				sourceSize = video->thumbnail.size();
++			}
++		}
++		if (sourceSize.isEmpty()) {
++			// Not fatal: without it the frame is decoded at the window size,
++			// which stretches rather than crops. Better than showing nothing.
++			LOG(("Wallpaper: could not read the size of '%1'.").arg(path));
++		}
++
++		generator = std::make_unique<FFmpeg::FrameGenerator>(bytes);
++		frameRate = generator->rate();
++		if (!(frameRate > 0.)) {
++			frameRate = kDefaultFrameRate;
++		}
++		LOG(("Wallpaper: decoding '%1', %2x%3, %4 frames at %5 fps."
++			).arg(path
++			).arg(sourceSize.width()
++			).arg(sourceSize.height()
++			).arg(generator->count()
++			).arg(frameRate));
++		advance();
++	}
++
++	WindowWallpaper *owner = nullptr;
++	base::Timer animation;
++	bool reportedFirstFrame = false;
++	double frameRate = kDefaultFrameRate;
++	QString currentPath;
++
++	// As decoded or read from the file.
++	QImage frame;
++
++	// `frame` cover-scaled to the window. For animated wallpapers these are the
++	// same object, because the frame is decoded at the right size to begin with.
++	QImage display;
++
++	QSize windowSize;
++	int ratio = 1;
++
++	// Frame size of the file itself, used to compute a cover-sized request.
++	QSize sourceSize;
++
++	std::unique_ptr<FFmpeg::FrameGenerator> generator;
++};
++
++WindowWallpaper &WindowWallpaper::Instance() {
++	static auto result = WindowWallpaper();
++	return result;
++}
++
++WindowWallpaper::WindowWallpaper()
++: _private(std::make_unique<Private>(this))
++, _path(ReadStoredPath()) {
++	_private->load(_path.current());
++	if (_private->frame.isNull() && !_private->generator) {
++		_path = QString();
++	}
++}
++
++WindowWallpaper::~WindowWallpaper() = default;
++
++bool WindowWallpaper::active() const {
++	return !_private->frame.isNull() || bool(_private->generator);
++}
++
++QString WindowWallpaper::path() const {
++	return _path.current();
++}
++
++rpl::producer<QString> WindowWallpaper::pathValue() const {
++	return _path.value();
++}
++
++bool WindowWallpaper::setPath(const QString &path) {
++	LOG(("Wallpaper: setPath('%1').").arg(path));
++	if (path.isEmpty() || !QFile::exists(path)) {
++		LOG(("Wallpaper: rejected, file missing."));
++		return false;
++	}
++	_private->load(path);
++	if (_private->frame.isNull() && !_private->generator) {
++		LOG(("Wallpaper: rejected, nothing loaded."));
++		return false;
++	}
++	_path = path;
++	WriteStoredPath(path);
++	UpdateWindows();
++	LOG(("Wallpaper: accepted."));
++	return true;
++}
++
++void WindowWallpaper::clear() {
++	_private->animation.cancel();
++	_private->generator = nullptr;
++	_private->frame = QImage();
++	_private->display = QImage();
++	_private->currentPath = QString();
++	_path = QString();
++	WriteStoredPath({});
++	UpdateWindows();
++}
++
++void WindowWallpaper::shutdown() {
++	_private->animation.cancel();
++	_private->generator = nullptr;
++}
++
++bool WindowWallpaper::paint(
++		QPainter &p,
++		not_null<const QWidget*> widget,
++		QRect clip,
++		QColor tint) const {
++	const auto window = widget->window();
++	const auto windowSize = window->size();
++	if (windowSize.isEmpty()) {
++		return false;
++	}
++	const auto pixelRatio = style::DevicePixelRatio();
++	const auto &image = _private->displayFor(windowSize, pixelRatio);
++	if (image.isNull()) {
++		return false;
++	}
++	const auto offset = widget->mapTo(window, QPoint());
++	const auto target = QRect(-offset, windowSize);
++
++	// The image is already cover-scaled for this window, so all that is left is
++	// to centre it. No transform, no smoothing, just a blit of the part the clip
++	// rectangle exposes.
++	const auto drawn = QSize(
++		image.width() / pixelRatio,
++		image.height() / pixelRatio);
++	const auto topLeft = target.center()
++		- QPoint(drawn.width() / 2, drawn.height() / 2);
++
++	p.save();
++	p.setClipRect(clip);
++	p.drawImage(topLeft, image);
++	if (tint.alpha() > 0) {
++		p.fillRect(clip, tint);
++	}
++	p.restore();
++	return true;
++}
++
++} // namespace Sealgram
+diff --git a/Telegram/SourceFiles/core/sealgram_wallpaper.h b/Telegram/SourceFiles/core/sealgram_wallpaper.h
+new file mode 100644
+index 0000000..2811c01
+--- /dev/null
++++ b/Telegram/SourceFiles/core/sealgram_wallpaper.h
+@@ -0,0 +1,47 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include <rpl/variable.h>
++
++class QPainter;
++class QWidget;
++
++namespace Sealgram {
++
++class WindowWallpaper final {
++public:
++	static WindowWallpaper &Instance();
++
++	[[nodiscard]] bool active() const;
++	[[nodiscard]] QString path() const;
++	[[nodiscard]] rpl::producer<QString> pathValue() const;
++
++	bool setPath(const QString &path);
++	void clear();
++	void shutdown();
++
++	// Paints one cover-scaled frame in top-level-window coordinates, so
++	// adjacent widgets (chat list and chat) show one continuous wallpaper.
++	[[nodiscard]] bool paint(
++		QPainter &p,
++		not_null<const QWidget*> widget,
++		QRect clip,
++		QColor tint = QColor(8, 15, 25, 128)) const;
++
++private:
++	WindowWallpaper();
++	~WindowWallpaper();
++
++	class Private;
++	std::unique_ptr<Private> _private;
++	rpl::variable<QString> _path;
++
++};
++
++} // namespace Sealgram
+diff --git a/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp b/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp
+index 59ad1a4..691d277 100644
+--- a/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp
++++ b/Telegram/SourceFiles/dialogs/dialogs_inner_widget.cpp
+@@ -26,6 +26,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "history/history_item.h"
+ #include "core/application.h"
+ #include "core/click_handler_types.h"
++#include "core/sealgram_wallpaper.h"
+ #include "core/shortcuts.h"
+ #include "core/ui_integration.h"
+ #include "ui/widgets/buttons.h"
+@@ -1000,6 +1001,11 @@ void InnerWidget::showSavedSublists() {
+ 
+ void InnerWidget::paintEvent(QPaintEvent *e) {
+ 	Painter p(this);
++	const auto customWallpaper
++		= Sealgram::WindowWallpaper::Instance().paint(
++			p,
++			this,
++			e->rect());
+ 
+ 	p.setInactive(
+ 		_controller->isGifPausedAtLeastFor(Window::GifPauseReason::Any));
+@@ -1020,7 +1026,7 @@ void InnerWidget::paintEvent(QPaintEvent *e) {
+ 		.folder = _openedFolder,
+ 		.forum = _openedForum,
+ 		.community = communityModeShown() ? _openedCommunity : nullptr,
+-		.currentBg = currentBg(),
++		.currentBg = customWallpaper ? QBrush(Qt::transparent) : currentBg(),
+ 		.filter = _filterId,
+ 		.now = ms,
+ 		.width = fullWidth,
+@@ -1089,7 +1095,8 @@ void InnerWidget::paintEvent(QPaintEvent *e) {
+ 			&& !context.rightButton
+ 			&& !expanding
+ 			&& !childListShown.shown
+-			&& (fullWidth > 0);
++			&& (fullWidth > 0)
++			&& !customWallpaper;
+ 		if (cacheAllowed && _rowsScrollCache.hasFresh(cacheKey, cacheSize)) {
+ 			context.topicsExpanded = 0.;
+ 			context.active = false;
+diff --git a/Telegram/SourceFiles/dialogs/dialogs_widget.cpp b/Telegram/SourceFiles/dialogs/dialogs_widget.cpp
+index 12e9602..9be00e9 100644
+--- a/Telegram/SourceFiles/dialogs/dialogs_widget.cpp
++++ b/Telegram/SourceFiles/dialogs/dialogs_widget.cpp
+@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "base/call_delayed.h"
+ #include "base/qt/qt_key_modifiers.h"
+ #include "base/options.h"
++#include "core/sealgram_wallpaper.h"
+ #include "dialogs/ui/chat_search_in.h"
+ #include "dialogs/ui/dialogs_stories_content.h"
+ #include "dialogs/ui/dialogs_stories_list.h"
+@@ -4757,13 +4758,18 @@ void Widget::paintEvent(QPaintEvent *e) {
+ 		_showAnimation->paintContents(p);
+ 		return;
+ 	}
++	const auto customWallpaper
++		= Sealgram::WindowWallpaper::Instance().paint(p, this, r);
+ 	const auto bg = anim::brush(
+ 		st::dialogsBg,
+ 		st::dialogsBgOver,
+ 		_childListShown.current());
++	const auto normalBg = customWallpaper
++		? QBrush(Qt::transparent)
++		: bg;
+ 	auto above = QRect(0, 0, width(), _scroll->y());
+ 	if (above.intersects(r)) {
+-		p.fillRect(above.intersected(r), bg);
++		p.fillRect(above.intersected(r), normalBg);
+ 	}
+ 
+ 	auto belowTop = _scroll->y() + _scroll->height();
+@@ -4780,7 +4786,12 @@ void Widget::paintEvent(QPaintEvent *e) {
+ 			+ suggestionsSkip;
+ 		const auto aboveBottom = above.y() + above.height();
+ 		if (top > aboveBottom) {
+-			p.fillRect(0, aboveBottom, width(), top - aboveBottom, bg);
++			p.fillRect(
++				0,
++				aboveBottom,
++				width(),
++				top - aboveBottom,
++				normalBg);
+ 		}
+ 		p.drawPixmapLeft(0, top, width(), _widthAnimationCache);
+ 		belowTop = top
+@@ -4789,7 +4800,7 @@ void Widget::paintEvent(QPaintEvent *e) {
+ 
+ 	auto below = QRect(0, belowTop, width(), height() - belowTop);
+ 	if (below.intersects(r)) {
+-		p.fillRect(below.intersected(r), bg);
++		p.fillRect(below.intersected(r), normalBg);
+ 	}
+ }
+ 
+diff --git a/Telegram/SourceFiles/window/section_widget.cpp b/Telegram/SourceFiles/window/section_widget.cpp
+index ed226f4..5aa16b5 100644
+--- a/Telegram/SourceFiles/window/section_widget.cpp
++++ b/Telegram/SourceFiles/window/section_widget.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "window/section_widget.h"
+ 
++#include "core/sealgram_wallpaper.h"
+ #include "mainwidget.h"
+ #include "mainwindow.h"
+ #include "ui/ui_utility.h"
+@@ -378,6 +379,13 @@ void SectionWidget::PaintBackground(
+ 		QRect clip,
+ 		bool paused) {
+ 	auto p = QPainter(widget);
++	if (Sealgram::WindowWallpaper::Instance().paint(
++			p,
++			widget,
++			clip,
++			QColor(8, 15, 25, 92))) {
++		return;
++	}
+ 	if (fromy) {
+ 		p.translate(0, fromy);
+ 		clip = clip.translated(0, -fromy);
+-- 
+2.54.0.windows.1
+

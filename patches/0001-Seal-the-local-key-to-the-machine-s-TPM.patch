@@ -1,0 +1,466 @@
+From e2768d1da61daa8a2baebf2a573eac7ef5bebc39 Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:32:15 +0300
+Subject: [PATCH 01/13] Seal the local key to the machine's TPM
+
+Upstream runs PBKDF2 with a single iteration when no local passcode is set,
+so the local key comes essentially from a salt stored in plaintext next to
+the data. Copying the tdata folder is enough to read everything.
+
+TpmSeed() signs a digest inside a non-exportable RSA key held by the CNG
+platform provider and returns a digest of the signature. PKCS#1 v1.5 is used
+deliberately: it has no randomised padding, so the same input always gives
+the same signature, which is what allows the result to be key material
+rather than a yes/no answer software could step past.
+
+Domain::startModern falls back to the unsealed derivation when the seeded
+one cannot open an existing key file, then re-seals it. Without that, a
+machine that gains a usable TPM after first run would show a passcode prompt
+the person never set and lose their local history.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../details/storage_file_utilities.cpp        |  32 ++-
+ .../storage/details/storage_file_utilities.h  |  16 +-
+ .../storage/details/storage_tpm_seal.cpp      | 262 ++++++++++++++++++
+ .../storage/details/storage_tpm_seal.h        |  33 +++
+ .../SourceFiles/storage/storage_domain.cpp    |  26 +-
+ 5 files changed, 363 insertions(+), 6 deletions(-)
+ create mode 100644 Telegram/SourceFiles/storage/details/storage_tpm_seal.cpp
+ create mode 100644 Telegram/SourceFiles/storage/details/storage_tpm_seal.h
+
+diff --git a/Telegram/SourceFiles/storage/details/storage_file_utilities.cpp b/Telegram/SourceFiles/storage/details/storage_file_utilities.cpp
+index ab80afb..95d85d3 100644
+--- a/Telegram/SourceFiles/storage/details/storage_file_utilities.cpp
++++ b/Telegram/SourceFiles/storage/details/storage_file_utilities.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "storage/details/storage_file_utilities.h"
+ 
++#include "storage/details/storage_tpm_seal.h"
+ #include "core/version.h"
+ #include "mtproto/mtproto_auth_key.h"
+ #include "base/platform/base_platform_file_utilities.h"
+@@ -301,9 +302,36 @@ bool CheckStreamStatus(QDataStream &stream) {
+ 
+ MTP::AuthKeyPtr CreateLocalKey(
+ 		const QByteArray &passcode,
+-		const QByteArray &salt) {
++		const QByteArray &salt,
++		LocalKeySeal seal) {
+ 	const auto s = bytes::make_span(salt);
+-	const auto hash = openssl::Sha512(s, bytes::make_span(passcode), s);
++
++	// Bind the key to this machine's TPM.
++	//
++	// Without this the derivation below is worth very little: with no local
++	// passcode - the default - the iteration count is 1, so the key comes
++	// essentially from the salt, and the salt is stored in plaintext right
++	// beside the data. Copying the folder is enough to read everything.
++	//
++	// The seed is produced by a key that lives inside the chip and cannot be
++	// exported, so a copied folder cannot be opened anywhere else. The salt is
++	// used as the context, which gives every account a distinct seed.
++	//
++	// Empty on machines with no usable TPM, where this reduces to exactly the
++	// upstream derivation - the client must still start on such machines. It is
++	// also skipped on request, to reopen data written before this machine had a
++	// TPM to seal with.
++	const auto seed = (seal == LocalKeySeal::Unsealed)
++		? QByteArray()
++		: TpmSeed(salt);
++
++	const auto hash = seed.isEmpty()
++		? openssl::Sha512(s, bytes::make_span(passcode), s)
++		: openssl::Sha512(
++			s,
++			bytes::make_span(passcode),
++			s,
++			bytes::make_span(seed));
+ 	const auto iterationsCount = passcode.isEmpty()
+ 		? 1 // Don't slow down for no password.
+ 		: kStrongIterationsCount;
+diff --git a/Telegram/SourceFiles/storage/details/storage_file_utilities.h b/Telegram/SourceFiles/storage/details/storage_file_utilities.h
+index f854c48..8179c26 100644
+--- a/Telegram/SourceFiles/storage/details/storage_file_utilities.h
++++ b/Telegram/SourceFiles/storage/details/storage_file_utilities.h
+@@ -20,9 +20,23 @@ namespace details {
+ void ClearKey(const FileKey &key, const QString &basePath);
+ 
+ [[nodiscard]] bool CheckStreamStatus(QDataStream &stream);
++
++// Whether the TPM seed is mixed into the derivation.
++//
++// Two derivations exist because a machine can gain a usable TPM after data has
++// already been written - the chip enabled in firmware, or Windows getting round
++// to provisioning the platform key. The seeded key would then not open data
++// sealed without one, and the person would be silently logged out with their
++// local history gone. Callers try Sealed first and fall back to Unsealed.
++enum class LocalKeySeal : uchar {
++	Sealed,
++	Unsealed,
++};
++
+ [[nodiscard]] MTP::AuthKeyPtr CreateLocalKey(
+ 	const QByteArray &passcode,
+-	const QByteArray &salt);
++	const QByteArray &salt,
++	LocalKeySeal seal = LocalKeySeal::Sealed);
+ [[nodiscard]] MTP::AuthKeyPtr CreateLegacyLocalKey(
+ 	const QByteArray &passcode,
+ 	const QByteArray &salt);
+diff --git a/Telegram/SourceFiles/storage/details/storage_tpm_seal.cpp b/Telegram/SourceFiles/storage/details/storage_tpm_seal.cpp
+new file mode 100644
+index 0000000..d6071be
+--- /dev/null
++++ b/Telegram/SourceFiles/storage/details/storage_tpm_seal.cpp
+@@ -0,0 +1,262 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "storage/details/storage_tpm_seal.h"
++
++#include "base/openssl_help.h"
++
++#ifdef Q_OS_WIN
++
++#include <windows.h>
++#include <ncrypt.h>
++
++#pragma comment(lib, "ncrypt.lib")
++
++namespace Storage::details {
++namespace {
++
++// One key per installation. Named so it is recognisable in the TPM key store.
++constexpr auto kKeyName = L"TelegramDesktop.LocalKeySeal";
++
++constexpr auto kKeyLengthBits = DWORD(2048);
++
++class Provider final {
++public:
++	Provider() {
++		// The platform provider is the TPM's face to CNG. Its absence means the
++		// machine has no usable chip, which is a normal outcome, not a failure.
++		const auto status = NCryptOpenStorageProvider(
++			&_handle,
++			MS_PLATFORM_KEY_STORAGE_PROVIDER,
++			0);
++		if (status != ERROR_SUCCESS) {
++			_handle = 0;
++		}
++	}
++
++	~Provider() {
++		if (_handle) {
++			NCryptFreeObject(_handle);
++		}
++	}
++
++	Provider(const Provider &) = delete;
++	Provider &operator=(const Provider &) = delete;
++
++	[[nodiscard]] explicit operator bool() const {
++		return _handle != 0;
++	}
++
++	[[nodiscard]] NCRYPT_PROV_HANDLE handle() const {
++		return _handle;
++	}
++
++private:
++	NCRYPT_PROV_HANDLE _handle = 0;
++
++};
++
++class Key final {
++public:
++	Key(const Provider &provider, bool createIfMissing) {
++		if (!provider) {
++			return;
++		}
++		auto status = NCryptOpenKey(
++			provider.handle(),
++			&_handle,
++			kKeyName,
++			0,
++			0);
++		if (status == ERROR_SUCCESS) {
++			return;
++		} else if (!createIfMissing) {
++			_handle = 0;
++			return;
++		}
++
++		// Deliberately not NCRYPT_OVERWRITE_KEY_FLAG: replacing the key would
++		// make every file already sealed with it unreadable forever.
++		status = NCryptCreatePersistedKey(
++			provider.handle(),
++			&_handle,
++			NCRYPT_RSA_ALGORITHM,
++			kKeyName,
++			0,
++			0);
++		if (status != ERROR_SUCCESS) {
++			_handle = 0;
++			return;
++		}
++
++		auto length = kKeyLengthBits;
++		NCryptSetProperty(
++			_handle,
++			NCRYPT_LENGTH_PROPERTY,
++			reinterpret_cast<PBYTE>(&length),
++			sizeof(length),
++			0);
++
++		// Belt and braces: the platform provider never exports TPM keys anyway.
++		auto policy = DWORD(0);
++		NCryptSetProperty(
++			_handle,
++			NCRYPT_EXPORT_POLICY_PROPERTY,
++			reinterpret_cast<PBYTE>(&policy),
++			sizeof(policy),
++			0);
++
++		status = NCryptFinalizeKey(_handle, 0);
++		if (status != ERROR_SUCCESS) {
++			NCryptFreeObject(_handle);
++			_handle = 0;
++		}
++	}
++
++	~Key() {
++		if (_handle) {
++			NCryptFreeObject(_handle);
++		}
++	}
++
++	Key(const Key &) = delete;
++	Key &operator=(const Key &) = delete;
++
++	[[nodiscard]] explicit operator bool() const {
++		return _handle != 0;
++	}
++
++	[[nodiscard]] NCRYPT_KEY_HANDLE handle() const {
++		return _handle;
++	}
++
++private:
++	NCRYPT_KEY_HANDLE _handle = 0;
++
++};
++
++// Signs `hash` inside the chip. PKCS#1 v1.5 has no randomised padding, so the
++// same input always produces the same signature - that is what lets the result
++// be used as key material instead of a yes/no answer software could step past.
++[[nodiscard]] QByteArray SignDeterministic(
++		const Key &key,
++		bytes::const_span hash) {
++	auto padding = BCRYPT_PKCS1_PADDING_INFO{ BCRYPT_SHA256_ALGORITHM };
++	auto size = DWORD(0);
++	auto status = NCryptSignHash(
++		key.handle(),
++		&padding,
++		reinterpret_cast<PBYTE>(const_cast<gsl::byte*>(hash.data())),
++		DWORD(hash.size()),
++		nullptr,
++		0,
++		&size,
++		NCRYPT_PAD_PKCS1_FLAG);
++	if (status != ERROR_SUCCESS || !size) {
++		return QByteArray();
++	}
++
++	auto result = QByteArray(int(size), Qt::Uninitialized);
++	status = NCryptSignHash(
++		key.handle(),
++		&padding,
++		reinterpret_cast<PBYTE>(const_cast<gsl::byte*>(hash.data())),
++		DWORD(hash.size()),
++		reinterpret_cast<PBYTE>(result.data()),
++		size,
++		&size,
++		NCRYPT_PAD_PKCS1_FLAG);
++	if (status != ERROR_SUCCESS) {
++		return QByteArray();
++	}
++	result.resize(int(size));
++	return result;
++}
++
++// Set TDESKTOP_TPM_SEAL=0 to derive keys without the chip.
++//
++// Existing sealed data cannot be downgraded this way - it simply will not open,
++// because the seed it was sealed with is missing. What this does allow is a
++// machine whose platform provider misbehaves to still be used, and it is how the
++// fallback in Domain::startModern gets exercised in testing.
++[[nodiscard]] bool SealingEnabled() {
++	wchar_t value[8] = { 0 };
++	const auto length = GetEnvironmentVariableW(
++		L"TDESKTOP_TPM_SEAL",
++		value,
++		DWORD(std::size(value)));
++	return !((length == 1) && (value[0] == L'0'));
++}
++
++} // namespace
++
++bool TpmSealingAvailable() {
++	const auto provider = Provider();
++	return provider && Key(provider, false);
++}
++
++QByteArray TpmSeed(const QByteArray &context) {
++	if (!SealingEnabled()) {
++		return QByteArray();
++	}
++	const auto provider = Provider();
++	if (!provider) {
++		return QByteArray();
++	}
++	const auto key = Key(provider, true);
++	if (!key) {
++		return QByteArray();
++	}
++
++	// The context is hashed first: NCryptSignHash signs a digest, and hashing
++	// also means a caller cannot choose the exact bytes handed to the chip.
++	const auto digest = openssl::Sha256(bytes::make_span(context));
++	const auto signature = SignDeterministic(key, digest);
++	if (signature.isEmpty()) {
++		return QByteArray();
++	}
++
++	// The signature itself is never returned: it is a structure an attacker
++	// holding the public key could reason about. A digest of it is not.
++	const auto seed = openssl::Sha256(bytes::make_span(signature));
++	return QByteArray(
++		reinterpret_cast<const char*>(seed.data()),
++		int(seed.size()));
++}
++
++void TpmForgetKey() {
++	const auto provider = Provider();
++	if (!provider) {
++		return;
++	}
++	auto handle = NCRYPT_KEY_HANDLE();
++	if (NCryptOpenKey(provider.handle(), &handle, kKeyName, 0, 0)
++		== ERROR_SUCCESS) {
++		NCryptDeleteKey(handle, 0);
++	}
++}
++
++} // namespace Storage::details
++
++#else // Q_OS_WIN
++
++namespace Storage::details {
++
++bool TpmSealingAvailable() {
++	return false;
++}
++
++QByteArray TpmSeed(const QByteArray &context) {
++	return QByteArray();
++}
++
++void TpmForgetKey() {
++}
++
++} // namespace Storage::details
++
++#endif // Q_OS_WIN
+diff --git a/Telegram/SourceFiles/storage/details/storage_tpm_seal.h b/Telegram/SourceFiles/storage/details/storage_tpm_seal.h
+new file mode 100644
+index 0000000..916dbe3
+--- /dev/null
++++ b/Telegram/SourceFiles/storage/details/storage_tpm_seal.h
+@@ -0,0 +1,33 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include <QtCore/QByteArray>
++
++namespace Storage::details {
++
++// Whether this machine can bind local data to its TPM.
++[[nodiscard]] bool TpmSealingAvailable();
++
++// Returns 32 bytes that only this machine's TPM can reproduce, derived from
++// `context` so that different accounts get different values.
++//
++// The private key lives inside the chip and cannot be exported, so the result
++// cannot be recomputed anywhere else - which is the whole point: a copied
++// tdata folder is useless on another computer.
++//
++// Returns an empty array when no usable TPM is present. Callers must treat that
++// as "no hardware binding" rather than as an error, otherwise the client would
++// refuse to start on machines without a TPM.
++[[nodiscard]] QByteArray TpmSeed(const QByteArray &context);
++
++// Removes the persisted TPM key. Only for tests and for a deliberate reset -
++// doing this makes every local file sealed with it permanently unreadable.
++void TpmForgetKey();
++
++} // namespace Storage::details
+diff --git a/Telegram/SourceFiles/storage/storage_domain.cpp b/Telegram/SourceFiles/storage/storage_domain.cpp
+index 7b4c29a..12943fb 100644
+--- a/Telegram/SourceFiles/storage/storage_domain.cpp
++++ b/Telegram/SourceFiles/storage/storage_domain.cpp
+@@ -137,10 +137,21 @@ Domain::StartModernResult Domain::startModern(
+ 	_passcodeKey = CreateLocalKey(passcode, salt);
+ 
+ 	EncryptedDescriptor keyInnerData, info;
++	auto sealAgain = false;
+ 	if (!DecryptLocal(keyInnerData, keyEncrypted, _passcodeKey)) {
+-		LOG(("App Info: could not decrypt pass-protected key from info file, "
+-			"maybe bad password..."));
+-		return StartModernResult::IncorrectPasscode;
++		// The key file may predate this machine having a usable TPM: a chip
++		// switched on in firmware, or a platform key Windows only provisioned
++		// later. Treating that as a wrong passcode would log the person out and
++		// abandon their local history for no gain, so try the derivation that
++		// does not involve the chip before believing the passcode is wrong.
++		_passcodeKey = CreateLocalKey(passcode, salt, LocalKeySeal::Unsealed);
++		if (!DecryptLocal(keyInnerData, keyEncrypted, _passcodeKey)) {
++			LOG(("App Info: could not decrypt pass-protected key from info "
++				"file, maybe bad password..."));
++			return StartModernResult::IncorrectPasscode;
++		}
++		LOG(("App Info: opened an unsealed key file, will seal it now."));
++		sealAgain = true;
+ 	}
+ 	auto key = Serialize::read<MTP::AuthKey::Data>(keyInnerData.stream);
+ 	if (keyInnerData.stream.status() != QDataStream::Ok
+@@ -208,6 +219,15 @@ Domain::StartModernResult Domain::startModern(
+ 	}
+ 	_owner->activateFromStorage(active);
+ 
++	// Left until here on purpose: rewriting the key file is only safe once the
++	// accounts have actually been read out of the old one. Doing it earlier and
++	// then failing would leave a key file describing accounts we never loaded.
++	if (sealAgain) {
++		encryptLocalKey(passcode);
++		writeAccounts();
++		LOG(("App Info: key file sealed to this machine's TPM."));
++	}
++
+ 	Ensures(!sessions.empty());
+ 	return StartModernResult::Success;
+ }
+-- 
+2.54.0.windows.1
+

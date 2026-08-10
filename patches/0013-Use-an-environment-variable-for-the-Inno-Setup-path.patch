@@ -1,0 +1,39 @@
+From d1fafd9478abbc359a6edca254763fa9e78dbc9f Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:51:32 +0300
+Subject: [PATCH 13/13] Use an environment variable for the Inno Setup path
+
+The document is about to be published, and a hardcoded C:\Users\<name> path
+puts the machine's account name in a public repository for no benefit.
+%LOCALAPPDATA% is also simply the more portable way to write it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ SEALGRAM.md | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/SEALGRAM.md b/SEALGRAM.md
+index f81331e..6236217 100644
+--- a/SEALGRAM.md
++++ b/SEALGRAM.md
+@@ -43,7 +43,7 @@ write marketing copy, commit messages, or UI text claiming otherwise.
+ | Installer output | `G:\src\tdesktop\out\Release\sealgram-setup-7.0.6-r2.exe` |
+ | MSVC toolchain | `G:\BuildTools` (VS Build Tools 17.14, MSVC 14.44.35207) |
+ | CMake | `G:\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe` |
+-| Inno Setup | `C:\Users\Romanspok\AppData\Local\Programs\Inno Setup 6\ISCC.exe` |
++| Inno Setup | `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe` |
+ 
+ Upstream base commit: `12e8d4a`. Generator: `Visual Studio 17 2022`.
+ `CMAKE_GENERATOR_INSTANCE=G:/BuildTools`.
+@@ -330,7 +330,7 @@ edit to upstream's `setup.iss`, so pulling a newer Telegram Desktop does not
+ conflict. Build it with:
+ 
+ ```powershell
+-& "C:\Users\Romanspok\AppData\Local\Programs\Inno Setup 6\ISCC.exe" `
++& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" `
+   /DReleasePath=G:\src\tdesktop\out\Release `
+   "G:\src\tdesktop\Telegram\build\sealgram_setup.iss"
+ ```
+-- 
+2.54.0.windows.1
+

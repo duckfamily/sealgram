@@ -1,0 +1,730 @@
+From 089450dd1804b16b558b3d256076e4dd12d25ded Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:33:38 +0300
+Subject: [PATCH 08/13] Rotate proxies when media stalls, and expose the state
+
+A proxy can carry the main datacentre perfectly while refusing the file
+datacentres, so messages arrive and photos never load. Rotation never
+noticed, because it only looked at mtp().dcstate() - the main datacentre -
+and stopped the moment that was connected.
+
+The signal used instead is restartsByTimeout() filtered to download
+datacentres, which is upstream's own definition of a stalled download. Three
+inside twenty-five seconds means the proxy, not the file. The offender is
+skipped for ten minutes and the quickest responding candidate takes over.
+If every candidate has failed on media the history is cleared rather than
+leaving someone stranded on a proxy that cannot load a photo.
+
+Also adds snapshots, a change stream, switch history with reasons and a
+stall counter, so the connection dashboard has something to read. probeAll()
+measures without switching: moving someone off a working proxy because they
+opened a page would be rude.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../core/proxy_rotation_manager.cpp           | 424 +++++++++++++++++-
+ .../SourceFiles/core/proxy_rotation_manager.h |  75 ++++
+ 2 files changed, 488 insertions(+), 11 deletions(-)
+
+diff --git a/Telegram/SourceFiles/core/proxy_rotation_manager.cpp b/Telegram/SourceFiles/core/proxy_rotation_manager.cpp
+index a643f0a..f149d78 100644
+--- a/Telegram/SourceFiles/core/proxy_rotation_manager.cpp
++++ b/Telegram/SourceFiles/core/proxy_rotation_manager.cpp
+@@ -7,13 +7,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "core/proxy_rotation_manager.h"
+ 
++#include "base/unixtime.h"
+ #include "core/application.h"
+ #include "core/core_settings.h"
++#include "logs.h"
+ #include "main/main_account.h"
+ #include "main/main_domain.h"
+ #include "mtproto/facade.h"
++#include "mtproto/mtp_instance.h"
+ 
+ #include <algorithm>
++#include <limits>
+ 
+ namespace Core {
+ namespace {
+@@ -21,6 +25,36 @@ namespace {
+ constexpr auto kProxyRotationCheckInterval = 2 * crl::time(1000);
+ constexpr auto kProxyRotationCheckLifetime = 20 * crl::time(1000);
+ constexpr auto kProxyRotationMaxActiveChecks = 10;
++constexpr auto kProxyBootstrapTimeout = 20 * crl::time(1000);
++
++// Rotating on media stalls.
++//
++// A proxy can carry the main datacentre perfectly while refusing or throttling
++// the file datacentres, and then messages arrive but photos and videos never
++// load. Rotation alone never noticed, because it only ever looked at
++// mtp().dcstate() - the main datacentre - and stopped the moment that was
++// connected. The signal used here instead is a download session having to be
++// restarted because it timed out, which is upstream's own definition of a
++// stalled download.
++//
++// One timeout is normal on any connection. Several inside one window is the
++// proxy, not the file.
++constexpr auto kMediaStallWindow = 25 * crl::time(1000);
++constexpr auto kMediaStallsToRotate = 3;
++
++// How long a proxy that failed on media is skipped for. Long enough not to come
++// straight back to it, short enough that a proxy which was merely having a bad
++// minute is not lost for the session.
++constexpr auto kMediaFailurePenalty = 10 * 60 * crl::time(1000);
++
++// Media rotation waits far less than the user's rotation timeout before
++// switching. The connection is up and messages work, so there is nothing to wait
++// for beyond hearing back from the candidates.
++constexpr auto kMediaSwitchTimeout = 4 * crl::time(1000);
++
++// Switches kept for the dashboard. Enough to see a pattern, not so many that
++// the page turns into a log file.
++constexpr auto kHistoryLimit = 12;
+ 
+ } // namespace
+ 
+@@ -30,11 +64,174 @@ ProxyRotationManager::ProxyRotationManager()
+ 	App().domain().accountsChanges(
+ 	) | rpl::on_next([=] {
+ 		stopChecking();
+-		reevaluate();
++		watchMediaHealth();
++		if (!startPendingBootstrap()) {
++			reevaluate();
++		}
+ 	}, _lifetime);
++	watchMediaHealth();
++}
++
++void ProxyRotationManager::watchMediaHealth() {
++	_mediaLifetime.destroy();
++	for (const auto account : productionAccounts()) {
++		account->mtp().restartsByTimeout(
++		) | rpl::filter([](MTP::ShiftedDcId shiftedDcId) {
++			return MTP::isDownloadDcId(shiftedDcId);
++		}) | rpl::on_next([=](MTP::ShiftedDcId shiftedDcId) {
++			noteDownloadStall();
++		}, _mediaLifetime);
++	}
++}
++
++void ProxyRotationManager::noteDownloadStall() {
++	const auto &settings = App().settings().proxy();
++	if (!settings.isEnabled()
++		|| !settings.selected()
++		|| !settings.proxyRotationEnabled()) {
++		// Nothing to blame, or the user asked us not to touch their choice.
++		return;
++	}
++	const auto now = crl::now();
++	_downloadStalls.erase(
++		std::remove_if(
++			_downloadStalls.begin(),
++			_downloadStalls.end(),
++			[&](crl::time at) { return (now - at) > kMediaStallWindow; }),
++		_downloadStalls.end());
++	_downloadStalls.push_back(now);
++	if (int(_downloadStalls.size()) < kMediaStallsToRotate) {
++		return;
++	}
++	_downloadStalls.clear();
++	rotateForMedia();
++	notifyStateChanged();
++}
++
++void ProxyRotationManager::rotateForMedia() {
++	auto &settings = App().settings().proxy();
++	if (settings.list().size() < 2) {
++		LOG(("Proxy: media stalling, but there is nowhere else to go."));
++		return;
++	}
++	const auto current = settings.selected();
++	ensure(current).mediaFailedAt = crl::now();
++	LOG(("Proxy: %1:%2 carries messages but not media, rotating."
++		).arg(current.host).arg(current.port));
++
++	stopChecking();
++	_rotatingForMedia = true;
++	startChecking();
++}
++
++bool ProxyRotationManager::mediaPenalised(
++		const Entry &entry,
++		crl::time now) const {
++	return entry.mediaFailedAt
++		&& ((now - entry.mediaFailedAt) < kMediaFailurePenalty);
++}
++
++void ProxyRotationManager::notifyStateChanged() {
++	_stateChanges.fire({});
++}
++
++rpl::producer<> ProxyRotationManager::stateChanges() const {
++	return _stateChanges.events();
++}
++
++std::vector<ProxyStatus> ProxyRotationManager::statuses() const {
++	const auto &settings = App().settings().proxy();
++	const auto now = crl::now();
++	const auto selected = settings.selected();
++	const auto enabled = settings.isEnabled();
++
++	auto result = std::vector<ProxyStatus>();
++	result.reserve(settings.list().size());
++	for (const auto &proxy : settings.list()) {
++		auto status = ProxyStatus{
++			.proxy = proxy,
++			.current = enabled && (proxy == selected),
++		};
++		// find() is non-const; the entries are ours and this only reads them.
++		const auto entry = ranges::find(
++			_entries,
++			proxy,
++			&Entry::proxy);
++		if (entry != end(_entries)) {
++			status.ping = entry->ping;
++			status.checking = entry->checking;
++			status.responded = (entry->availableAt != 0);
++			status.mediaFailed = mediaPenalised(*entry, now);
++		}
++		result.push_back(std::move(status));
++	}
++	ranges::sort(result, [](const ProxyStatus &a, const ProxyStatus &b) {
++		// Current first so it is never hunted for, then everything that
++		// answered by how fast it did, then the silent ones.
++		if (a.current != b.current) {
++			return a.current;
++		} else if (a.responded != b.responded) {
++			return a.responded;
++		} else if (a.responded && (a.ping != b.ping)) {
++			return a.ping < b.ping;
++		}
++		return false;
++	});
++	return result;
++}
++
++const std::vector<ProxySwitchRecord> &ProxyRotationManager::history() const {
++	return _history;
++}
++
++int ProxyRotationManager::recentMediaStalls() const {
++	const auto now = crl::now();
++	return int(ranges::count_if(_downloadStalls, [&](crl::time at) {
++		return (now - at) <= kMediaStallWindow;
++	}));
++}
++
++void ProxyRotationManager::recordSwitch(
++		const MTP::ProxyData &to,
++		ProxySwitchReason reason,
++		int ping) {
++	const auto describe = [](const MTP::ProxyData &proxy) {
++		return proxy
++			? (proxy.host + ':' + QString::number(proxy.port))
++			: QString();
++	};
++	const auto &settings = App().settings().proxy();
++	_history.insert(begin(_history), ProxySwitchRecord{
++		.from = settings.isEnabled() ? describe(settings.selected()) : QString(),
++		.to = describe(to),
++		.reason = reason,
++		.when = base::unixtime::now(),
++		.ping = ping,
++	});
++	if (_history.size() > kHistoryLimit) {
++		_history.resize(kHistoryLimit);
++	}
++}
++
++void ProxyRotationManager::probeAll() {
++	const auto &settings = App().settings().proxy();
++	if (settings.list().empty()) {
++		return;
++	}
++	stopChecking();
++	_probingOnly = true;
++	_checking = true;
++	_switchStartedAt = crl::now();
++	updateProbeOrder();
++	runChecks();
++	notifyStateChanged();
+ }
+ 
+ void ProxyRotationManager::settingsChanged() {
++	if (!_applyingBootstrapProxy && !_pendingBootstrapProxies.empty()) {
++		_pendingBootstrapProxies.clear();
++		App().finishSealgramProxyBootstrap();
++	}
+ 	stopChecking();
+ 	pruneRemovedEntries();
+ 	reevaluate();
+@@ -45,9 +242,79 @@ void ProxyRotationManager::handleConnectionStateChanged(
+ 		int32 state) {
+ 	(void)account;
+ 	(void)state;
++	if (_bootstrapping) {
++		return;
++	}
++	if (!_pendingBootstrapProxies.empty()) {
++		stopChecking();
++		if (startPendingBootstrap()) {
++			return;
++		}
++	}
+ 	reevaluate();
+ }
+ 
++void ProxyRotationManager::bootstrapBestProxy(
++		const std::vector<MTP::ProxyData> &proxies) {
++	stopChecking();
++	_pendingBootstrapProxies = proxies;
++	if (proxies.empty()) {
++		return;
++	}
++	(void)startPendingBootstrap();
++}
++
++void ProxyRotationManager::cancelBootstrap() {
++	stopChecking();
++	_pendingBootstrapProxies.clear();
++}
++
++bool ProxyRotationManager::startPendingBootstrap() {
++	if (_pendingBootstrapProxies.empty()) {
++		return false;
++	}
++	auto account = static_cast<Main::Account*>(nullptr);
++	for (const auto &entry : App().domain().accounts()) {
++		if (entry.account->mtpExists()
++			&& !entry.account->mtp().isTestMode()) {
++			account = entry.account.get();
++			break;
++		}
++	}
++	if (!account) {
++		_applyingBootstrapProxy = true;
++		App().setCurrentProxy(
++			_pendingBootstrapProxies.front(),
++			MTP::ProxyData::Settings::Enabled);
++		_applyingBootstrapProxy = false;
++		App().settings().proxy().setProxyRotationEnabled(true);
++		App().saveSettingsDelayed();
++		return true;
++	}
++
++	_checking = true;
++	_bootstrapping = true;
++	_probeOrder.clear();
++	_nextCheckIndex = 0;
++	const auto &settings = App().settings().proxy();
++	for (const auto &proxy : _pendingBootstrapProxies) {
++		const auto index = settings.indexInList(proxy);
++		if (index < 0) {
++			continue;
++		}
++		auto &state = ensure(proxy);
++		state.ping = 0;
++		state.availableAt = 0;
++		state.bootstrapTried = false;
++		_probeOrder.push_back(index);
++	}
++	for (auto i = 0; i != kProxyRotationMaxActiveChecks; ++i) {
++		startNextCheck();
++	}
++	_switchTimer.callOnce(kProxyBootstrapTimeout);
++	return true;
++}
++
+ bool ProxyRotationManager::shouldObserve() const {
+ 	const auto &settings = App().settings().proxy();
+ 	return settings.isEnabled()
+@@ -69,6 +336,14 @@ std::vector<not_null<Main::Account*>> ProxyRotationManager::productionAccounts()
+ }
+ 
+ not_null<Main::Account*> ProxyRotationManager::accountForChecks() const {
++	if (_bootstrapping) {
++		for (const auto &entry : App().domain().accounts()) {
++			const auto account = entry.account.get();
++			if (account->mtpExists() && !account->mtp().isTestMode()) {
++				return account;
++			}
++		}
++	}
+ 	if (App().someSessionExists()
+ 		&& App().activeAccount().sessionExists()
+ 		&& !App().activeAccount().mtp().isTestMode()) {
+@@ -111,7 +386,12 @@ void ProxyRotationManager::reevaluate() {
+ 		return account->mtp().dcstate();
+ 	};
+ 	if (ranges::contains(accounts, MTP::ConnectedState, stateProj)) {
+-		stopChecking();
++		// A media rotation runs precisely while the main datacentre is happy,
++		// so this is the one case where a healthy connection must not cancel
++		// the search.
++		if (!_rotatingForMedia) {
++			stopChecking();
++		}
+ 		return;
+ 	}
+ 	startChecking();
+@@ -126,15 +406,20 @@ void ProxyRotationManager::startChecking() {
+ 	_switchStartedAt = crl::now();
+ 	updateProbeOrder();
+ 	runChecks();
+-	const auto timeout = App().settings().proxy().proxyRotationTimeout();
+-	_switchTimer.callOnce(timeout * crl::time(1000));
++	const auto timeout = _rotatingForMedia
++		? kMediaSwitchTimeout
++		: (App().settings().proxy().proxyRotationTimeout() * crl::time(1000));
++	_switchTimer.callOnce(timeout);
+ }
+ 
+ void ProxyRotationManager::stopChecking() {
+ 	_checkTimer.cancel();
+ 	_switchTimer.cancel();
+ 	_checking = false;
++	_bootstrapping = false;
+ 	_waitingToSwitch = false;
++	_rotatingForMedia = false;
++	_probingOnly = false;
+ 	_switchStartedAt = 0;
+ 	_probeOrder.clear();
+ 	_nextCheckIndex = 0;
+@@ -229,6 +514,9 @@ void ProxyRotationManager::startNextCheck() {
+ 	auto attemptsLeft = int(_probeOrder.size());
+ 	while (attemptsLeft-- > 0) {
+ 		if (_nextCheckIndex >= int(_probeOrder.size())) {
++			if (_bootstrapping) {
++				return;
++			}
+ 			_nextCheckIndex = 0;
+ 		}
+ 		const auto listIndex = _probeOrder[_nextCheckIndex++];
+@@ -237,10 +525,12 @@ void ProxyRotationManager::startNextCheck() {
+ 		}
+ 		const auto &proxy = settings.list()[listIndex];
+ 		auto &entry = ensure(proxy);
+-		if (entry.checking) {
++		if (entry.checking
++			|| (_bootstrapping && entry.bootstrapTried)) {
+ 			continue;
+ 		}
+ 		entry.checking = true;
++		entry.bootstrapTried = _bootstrapping;
+ 		entry.startedAt = crl::now();
+ 		MTP::StartProxyCheck(
+ 			&accountForChecks()->mtp(),
+@@ -259,6 +549,10 @@ void ProxyRotationManager::startNextCheck() {
+ }
+ 
+ void ProxyRotationManager::switchTimerDone() {
++	if (_bootstrapping) {
++		finishBootstrap();
++		return;
++	}
+ 	if (!_checking || !shouldSwitchToAvailable()) {
+ 		return;
+ 	}
+@@ -288,12 +582,24 @@ void ProxyRotationManager::checkDone(
+ 	entry->checking = false;
+ 	entry->startedAt = 0;
+ 	entry->availableAt = crl::now();
++	entry->ping = ping;
++	notifyStateChanged();
+ 	const auto proxySettings = &App().settings().proxy();
+ 	if (const auto index = proxySettings->indexInList(proxy); index >= 0) {
+ 		if (proxySettings->promoteProxyRotationPreferredIndex(index)) {
+ 			App().saveSettingsDelayed();
+ 		}
+ 	}
++	if (_bootstrapping) {
++		for (auto i = 0; i != kProxyRotationMaxActiveChecks; ++i) {
++			startNextCheck();
++		}
++		if (!ranges::contains(_entries, true, &Entry::checking)
++			&& (_nextCheckIndex >= int(_probeOrder.size()))) {
++			finishBootstrap();
++		}
++		return;
++	}
+ 	updateProbeOrder();
+ 	if (_waitingToSwitch && shouldSwitchToAvailable()) {
+ 		_waitingToSwitch = !switchToAvailable();
+@@ -315,6 +621,51 @@ void ProxyRotationManager::checkFailed(
+ 	}
+ 	entry->checking = false;
+ 	entry->startedAt = 0;
++	notifyStateChanged();
++	if (_bootstrapping) {
++		startNextCheck();
++		if (!ranges::contains(_entries, true, &Entry::checking)
++			&& (_nextCheckIndex >= int(_probeOrder.size()))) {
++			finishBootstrap();
++		}
++	}
++}
++
++void ProxyRotationManager::finishBootstrap() {
++	if (!_bootstrapping || _probeOrder.empty()) {
++		return;
++	}
++	const auto &settings = App().settings().proxy();
++	auto best = MTP::ProxyData();
++	auto bestPing = std::numeric_limits<int>::max();
++	for (const auto index : _probeOrder) {
++		if (index < 0 || index >= int(settings.list().size())) {
++			continue;
++		}
++		const auto &proxy = settings.list()[index];
++		const auto entry = find(proxy);
++		if (entry && entry->ping > 0 && entry->ping < bestPing) {
++			best = proxy;
++			bestPing = entry->ping;
++		}
++	}
++	if (!best) {
++		best = settings.list()[_probeOrder.front()];
++	}
++	_bootstrapping = false;
++	_checkTimer.cancel();
++	_switchTimer.cancel();
++	clearPendingChecks();
++	_checking = false;
++	_pendingBootstrapProxies.clear();
++	_applyingBootstrapProxy = true;
++	App().setCurrentProxy(best, MTP::ProxyData::Settings::Enabled);
++	_applyingBootstrapProxy = false;
++	App().settings().proxy().setProxyRotationEnabled(true);
++	App().finishSealgramProxyBootstrap();
++	App().saveSettingsDelayed();
++	LOG(("Proxy feed: first launch selected best proxy (%1 ms)."
++		).arg(bestPing == std::numeric_limits<int>::max() ? 0 : bestPing));
+ }
+ 
+ bool ProxyRotationManager::switchToAvailable() {
+@@ -322,6 +673,16 @@ bool ProxyRotationManager::switchToAvailable() {
+ 		return false;
+ 	}
+ 	const auto &settings = App().settings().proxy();
++	const auto now = crl::now();
++	const auto current = settings.selected();
++
++	// Pick the quickest of everything that answered this round rather than the
++	// first one in probe order. When the reason for switching is that media
++	// will not come through, the point is to land somewhere better, not merely
++	// somewhere else.
++	auto bestIndex = -1;
++	auto bestPing = std::numeric_limits<int>::max();
++	auto skippedPenalised = false;
+ 	for (const auto index : _probeOrder) {
+ 		if (index < 0 || index >= int(settings.list().size())) {
+ 			continue;
+@@ -334,17 +695,58 @@ bool ProxyRotationManager::switchToAvailable() {
+ 		if (entry->availableAt < _switchStartedAt) {
+ 			continue;
+ 		}
+-		_waitingToSwitch = false;
+-		App().setCurrentProxy(proxy, MTP::ProxyData::Settings::Enabled);
+-		App().saveSettingsDelayed();
+-		return true;
++		if (mediaPenalised(*entry, now)) {
++			skippedPenalised = true;
++			continue;
++		}
++		if (_rotatingForMedia && (proxy == current)) {
++			// It answers a ping perfectly well. That was never the problem.
++			continue;
++		}
++		if (entry->ping < bestPing) {
++			bestPing = entry->ping;
++			bestIndex = index;
++		}
++	}
++	if (bestIndex < 0) {
++		// Everything that responded is either the proxy we are running from or
++		// has failed on media before. Rather than stay on something that cannot
++		// load a photo, forget the history and let the next round reconsider.
++		if (skippedPenalised) {
++			LOG(("Proxy: every candidate has failed on media, clearing history."));
++			for (auto &entry : _entries) {
++				entry.mediaFailedAt = 0;
++			}
++		}
++		return false;
+ 	}
+-	return false;
++
++	const auto &proxy = settings.list()[bestIndex];
++	const auto reason = _rotatingForMedia
++		? ProxySwitchReason::MediaStall
++		: ProxySwitchReason::NoConnection;
++	_waitingToSwitch = false;
++	_rotatingForMedia = false;
++	LOG(("Proxy: switching to %1:%2, ping %3ms."
++		).arg(proxy.host).arg(proxy.port).arg(bestPing));
++	recordSwitch(proxy, reason, bestPing);
++	App().setCurrentProxy(proxy, MTP::ProxyData::Settings::Enabled);
++	App().saveSettingsDelayed();
++	notifyStateChanged();
++	return true;
+ }
+ 
+ bool ProxyRotationManager::shouldSwitchToAvailable() const {
+-	if (!_checking || !shouldObserve()) {
++	if (_probingOnly) {
++		// A measurement asked for from the dashboard. Moving someone off a
++		// working proxy because they opened a page would be rude.
+ 		return false;
++	} else if (!_checking || !shouldObserve()) {
++		return false;
++	} else if (_rotatingForMedia) {
++		// The main datacentre being connected is the normal state here, so the
++		// usual test would refuse the switch that was just asked for.
++		return true;
+ 	}
+ 	const auto accounts = productionAccounts();
+ 	return !accounts.empty()
+diff --git a/Telegram/SourceFiles/core/proxy_rotation_manager.h b/Telegram/SourceFiles/core/proxy_rotation_manager.h
+index c1fee27..2ec7018 100644
+--- a/Telegram/SourceFiles/core/proxy_rotation_manager.h
++++ b/Telegram/SourceFiles/core/proxy_rotation_manager.h
+@@ -10,7 +10,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "base/timer.h"
+ #include "mtproto/proxy_check.h"
+ 
++#include <rpl/event_stream.h>
+ #include <rpl/lifetime.h>
++#include <rpl/producer.h>
+ #include <vector>
+ 
+ namespace Main {
+@@ -19,6 +21,33 @@ class Account;
+ 
+ namespace Core {
+ 
++// Why the client moved off a proxy. Shown in the connection dashboard, where
++// "it switched and I do not know why" is exactly the complaint being answered.
++enum class ProxySwitchReason : uchar {
++	Manual,        // the person chose it themselves
++	NoConnection,  // nothing was connecting at all
++	MediaStall,    // messages worked, media did not
++	Bootstrap,     // first proxy on a profile with no account yet
++};
++
++// A proxy as the dashboard sees it.
++struct ProxyStatus {
++	MTP::ProxyData proxy;
++	int ping = 0;              // Milliseconds; meaningless unless `responded`.
++	bool checking = false;
++	bool responded = false;
++	bool current = false;
++	bool mediaFailed = false;
++};
++
++struct ProxySwitchRecord {
++	QString from;              // "host:port", empty when there was none
++	QString to;
++	ProxySwitchReason reason = ProxySwitchReason::Manual;
++	TimeId when = 0;
++	int ping = 0;
++};
++
+ class ProxyRotationManager final {
+ public:
+ 	ProxyRotationManager();
+@@ -27,6 +56,23 @@ public:
+ 	void handleConnectionStateChanged(
+ 		not_null<Main::Account*> account,
+ 		int32 state);
++	void bootstrapBestProxy(const std::vector<MTP::ProxyData> &proxies);
++	void cancelBootstrap();
++
++	// Read by the connection dashboard. Everything here is a snapshot: the
++	// dashboard rebuilds on `stateChanges()` rather than holding references
++	// into the manager, because entries are pruned as the proxy list changes.
++	[[nodiscard]] std::vector<ProxyStatus> statuses() const;
++	[[nodiscard]] const std::vector<ProxySwitchRecord> &history() const;
++	[[nodiscard]] rpl::producer<> stateChanges() const;
++
++	// How many download sessions have stalled inside the current window. Zero
++	// means media is flowing; anything else is the reason a switch is coming.
++	[[nodiscard]] int recentMediaStalls() const;
++
++	// Measures every proxy without switching to any of them, so that someone
++	// looking at the dashboard sees fresh numbers instead of stale ones.
++	void probeAll();
+ 
+ private:
+ 	struct Entry {
+@@ -36,6 +82,11 @@ private:
+ 		bool checking = false;
+ 		crl::time startedAt = 0;
+ 		crl::time availableAt = 0;
++		int ping = 0;
++		bool bootstrapTried = false;
++
++		// When this proxy last failed to carry media. Skipped while recent.
++		crl::time mediaFailedAt = 0;
+ 	};
+ 
+ 	[[nodiscard]] bool shouldObserve() const;
+@@ -46,6 +97,7 @@ private:
+ 
+ 	void reevaluate();
+ 	void startChecking();
++	[[nodiscard]] bool startPendingBootstrap();
+ 	void stopChecking();
+ 	void pruneRemovedEntries();
+ 	void updateProbeOrder();
+@@ -54,6 +106,7 @@ private:
+ 	void pruneExpiredChecks();
+ 	void startNextCheck();
+ 	void switchTimerDone();
++	void finishBootstrap();
+ 	void clearPendingChecks();
+ 	void checkDone(
+ 		const MTP::ProxyData &proxy,
+@@ -65,15 +118,37 @@ private:
+ 	[[nodiscard]] bool switchToAvailable();
+ 	[[nodiscard]] bool shouldSwitchToAvailable() const;
+ 
++	// Media health. See the comment on kMediaStallWindow in the .cpp for why
++	// the main datacentre's state is not enough to judge a proxy by.
++	void watchMediaHealth();
++	void noteDownloadStall();
++	void rotateForMedia();
++	[[nodiscard]] bool mediaPenalised(const Entry &entry, crl::time now) const;
++
++	void recordSwitch(
++		const MTP::ProxyData &to,
++		ProxySwitchReason reason,
++		int ping);
++	void notifyStateChanged();
++
+ 	base::Timer _checkTimer;
+ 	base::Timer _switchTimer;
+ 	std::vector<Entry> _entries;
+ 	std::vector<int> _probeOrder;
++	std::vector<MTP::ProxyData> _pendingBootstrapProxies;
++	std::vector<crl::time> _downloadStalls;
++	std::vector<ProxySwitchRecord> _history;
+ 	int _nextCheckIndex = 0;
+ 	bool _checking = false;
++	bool _bootstrapping = false;
++	bool _applyingBootstrapProxy = false;
+ 	bool _waitingToSwitch = false;
++	bool _rotatingForMedia = false;
++	bool _probingOnly = false;
+ 	crl::time _switchStartedAt = 0;
++	rpl::event_stream<> _stateChanges;
+ 	rpl::lifetime _lifetime;
++	rpl::lifetime _mediaLifetime;
+ 
+ };
+ 
+-- 
+2.54.0.windows.1
+

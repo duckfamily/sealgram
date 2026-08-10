@@ -1,0 +1,629 @@
+From 240998f587009191d69eb34233db0682cf6e7e21 Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:33:58 +0300
+Subject: [PATCH 10/13] Wire the new subsystems into Application
+
+Registers the new sources, starts the proxy feed, prunes expired entries
+before the network is consulted, and shuts the wallpaper down before the
+global clip subsystem during teardown.
+
+considerProxyFallback keys on Account::mtpExists() rather than
+sessionExists(). The person this is for is most likely sitting on the login
+screen unable to authorise precisely because nothing gets through, and
+requiring a session would have skipped them entirely - which made the whole
+fallback dead code for its own main case.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Telegram/CMakeLists.txt                   |  18 +-
+ Telegram/SourceFiles/core/application.cpp | 313 +++++++++++++++++++++-
+ Telegram/SourceFiles/core/application.h   |  45 ++++
+ Telegram/SourceFiles/main/main_account.h  |   7 +
+ 4 files changed, 380 insertions(+), 3 deletions(-)
+
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index 2844ab5..62a4de7 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -570,6 +570,10 @@ PRIVATE
+     core/file_utilities.h
+     core/launcher.cpp
+     core/launcher.h
++    core/sealgram_privacy.cpp
++    core/sealgram_privacy.h
++    core/sealgram_wallpaper.cpp
++    core/sealgram_wallpaper.h
+     core/local_url_handlers.cpp
+     core/local_url_handlers.h
+     core/phone_click_handler.cpp
+@@ -582,6 +586,8 @@ PRIVATE
+     core/ui_integration.h
+     core/update_checker.cpp
+     core/update_checker.h
++    core/update_feed.cpp
++    core/update_feed.h
+     core/utils.cpp
+     core/utils.h
+     core/version.h
+@@ -1797,6 +1803,8 @@ PRIVATE
+     settings/sections/settings_local_storage.h
+     settings/sections/settings_main.cpp
+     settings/sections/settings_main.h
++    settings/sections/settings_sealgram.cpp
++    settings/sections/settings_sealgram.h
+     settings/settings_recent_searches.cpp
+     settings/settings_recent_searches.h
+     settings/settings_search.cpp
+@@ -1830,6 +1838,12 @@ PRIVATE
+     settings/sections/settings_websites.h
+     storage/details/storage_file_utilities.cpp
+     storage/details/storage_file_utilities.h
++    storage/details/storage_tpm_seal.cpp
++    storage/details/storage_tpm_seal.h
++    core/process_hardening.cpp
++    core/process_hardening.h
++    mtproto/proxy_feed.cpp
++    mtproto/proxy_feed.h
+     storage/details/storage_settings_scheme.cpp
+     storage/details/storage_settings_scheme.h
+     storage/download_manager_mtproto.cpp
+@@ -2270,7 +2284,7 @@ else()
+         set(bundle_identifier "com.tdesktop.Telegram")
+     endif()
+     set(bundle_entitlements "Telegram.entitlements")
+-    set(output_name "Telegram")
++    set(output_name "Sealgram")
+ endif()
+ 
+ if (CMAKE_GENERATOR STREQUAL Xcode)
+@@ -2328,6 +2342,8 @@ if (MSVC)
+     target_link_libraries(Telegram
+     PRIVATE
+         delayimp
++        # CNG, for sealing the local key to the machine's TPM.
++        ncrypt
+     )
+     target_link_options(Telegram
+     PRIVATE
+diff --git a/Telegram/SourceFiles/core/application.cpp b/Telegram/SourceFiles/core/application.cpp
+index c8a464f..c81c076 100644
+--- a/Telegram/SourceFiles/core/application.cpp
++++ b/Telegram/SourceFiles/core/application.cpp
+@@ -23,11 +23,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "base/unixtime.h"
+ #include "core/core_settings.h"
+ #include "core/update_checker.h"
++#include "core/update_feed.h"
+ #include "core/shortcuts.h"
+ #include "core/sandbox.h"
+ #include "core/local_url_handlers.h"
+ #include "core/launcher.h"
+ #include "core/proxy_rotation_manager.h"
++#include "core/sealgram_wallpaper.h"
+ #include "core/ui_integration.h"
+ #include "core/version.h"
+ #include "chat_helpers/emoji_keywords.h"
+@@ -64,6 +66,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "media/view/media_view_open_common.h"
+ #include "mtproto/mtproto_dc_options.h"
+ #include "mtproto/mtproto_config.h"
++#include "mtproto/mtp_instance.h"
++#include "mtproto/facade.h"
++#include "mtproto/proxy_feed.h"
+ #include "media/audio/media_audio_track.h"
+ #include "media/player/media_player_instance.h"
+ #include "media/player/media_player_float.h"
+@@ -109,6 +114,12 @@ namespace {
+ constexpr auto kQuitPreventTimeoutMs = crl::time(1500);
+ constexpr auto kAutoLockTimeoutLateMs = crl::time(3000);
+ constexpr auto kClearEmojiImageSourceTimeout = 10 * crl::time(1000);
++constexpr auto kSealgramProxyFeedEnabled = "sealgram.proxy-feed-enabled";
++constexpr auto kSealgramUpdateChecksEnabled = "sealgram.update-checks-enabled";
++constexpr auto kSealgramProxyBootstrapCompleted
++	= "sealgram.proxy-bootstrap-completed";
++constexpr auto kSealgramProxyBootstrapPending
++	= "sealgram.proxy-bootstrap-pending";
+ 
+ LaunchState GlobalLaunchState/* = LaunchState::Running*/;
+ 
+@@ -139,6 +150,44 @@ base::options::toggle OptionSkipUrlSchemeRegister({
+ 	.description = "Don't re-register tg:// URL scheme on autoupdate.",
+ });
+ 
++void ShowSealgramUpdate(
++		not_null<Window::Controller*> window,
++		const UpdateFeedResult &result) {
++	const auto version = result.version;
++	const auto installerUrl = result.installerUrl;
++	window->show(Ui::MakeConfirmBox({
++		.text = tr::lng_sealgram_update_text(
++			tr::now,
++			lt_version,
++			result.displayVersion,
++			lt_changes,
++			result.notes),
++		.confirmed = [=] {
++			PostponeUpdate(version);
++			UrlClickHandler::Open(installerUrl);
++		},
++		.cancelled = [=] {
++			PostponeUpdate(version);
++		},
++		.confirmText = tr::lng_sealgram_update_download(tr::now),
++		.cancelText = tr::lng_settings_restart_later(tr::now),
++		.title = tr::lng_sealgram_update_title(tr::now),
++	}));
++}
++
++void ShowSealgramUpdateResult(
++		not_null<Window::Controller*> window,
++		bool success) {
++	window->show(Ui::MakeInformBox({
++		.text = success
++			? tr::lng_sealgram_update_current_text()
++			: tr::lng_sealgram_update_error_text(),
++		.title = success
++			? tr::lng_sealgram_update_current_title()
++			: tr::lng_sealgram_update_error_title(),
++	}));
++}
++
+ } // namespace
+ 
+ Application *Application::Instance = nullptr;
+@@ -161,6 +210,7 @@ Application::Application()
+ , _databases(std::make_unique<Storage::Databases>())
+ , _animationsManager(std::make_unique<Ui::Animations::Manager>())
+ , _clearEmojiImageLoaderTimer([=] { clearEmojiSourceImages(); })
++, _proxyFallback([=] { considerProxyFallback(); })
+ , _audio(std::make_unique<Media::Audio::Instance>())
+ , _fallbackProductionConfig(
+ 	std::make_unique<MTP::Config>(MTP::Environment::Production))
+@@ -248,6 +298,7 @@ Application::~Application() {
+ 	Shortcuts::Finish();
+ 
+ 	Ui::Emoji::Clear();
++	Sealgram::WindowWallpaper::Instance().shutdown();
+ 	Media::Clip::Finish();
+ 
+ 	Ui::FinishCachedCorners();
+@@ -279,6 +330,10 @@ void Application::run() {
+ 
+ 	refreshGlobalProxy(); // Depends on app settings being read.
+ 
++	if (sealgramProxyFeedEnabled()) {
++		refreshProxyFeed();
++	}
++
+ 	if (const auto old = Local::oldSettingsVersion(); old < AppVersion) {
+ 		autoRegisterUrlScheme();
+ 		Platform::NewVersionLaunched(old);
+@@ -342,6 +397,7 @@ void Application::run() {
+ 	_windows.emplace(nullptr, std::make_unique<Window::Controller>());
+ 	setLastActiveWindow(_windows.front().second.get());
+ 	_windowInSettings = _lastActivePrimaryWindow = _lastActiveWindow;
++	checkSealgramUpdate(UpdateCheckSource::Automatic);
+ 
+ 	_domain->activeChanges(
+ 	) | rpl::on_next([=](not_null<Main::Account*> account) {
+@@ -797,6 +853,39 @@ void Application::saveSettings() {
+ 	Local::writeSettings();
+ }
+ 
++bool Application::sealgramProxyFeedEnabled() {
++	return settings().readPref<bool>(kSealgramProxyFeedEnabled, true);
++}
++
++void Application::setSealgramProxyFeedEnabled(bool enabled) {
++	if (sealgramProxyFeedEnabled() == enabled) {
++		return;
++	}
++	settings().writePref<bool>(kSealgramProxyFeedEnabled, enabled);
++	if (!enabled) {
++		_private->proxyRotation->cancelBootstrap();
++	}
++	saveSettingsDelayed();
++}
++
++void Application::finishSealgramProxyBootstrap() {
++	settings().writePref<bool>(kSealgramProxyBootstrapPending, false);
++	settings().writePref<bool>(kSealgramProxyBootstrapCompleted, true);
++	saveSettingsDelayed();
++}
++
++bool Application::sealgramUpdateChecksEnabled() {
++	return settings().readPref<bool>(kSealgramUpdateChecksEnabled, true);
++}
++
++void Application::setSealgramUpdateChecksEnabled(bool enabled) {
++	if (sealgramUpdateChecksEnabled() == enabled) {
++		return;
++	}
++	settings().writePref<bool>(kSealgramUpdateChecksEnabled, enabled);
++	saveSettingsDelayed();
++}
++
+ bool Application::canReadDefaultDownloadPath() const {
+ 	return KSandbox::isInside()
+ 		? base::CanReadDirectory(
+@@ -854,6 +943,10 @@ void Application::proxyRotationSettingsChanged() {
+ 	_private->proxyRotation->settingsChanged();
+ }
+ 
++ProxyRotationManager &Application::proxyRotation() const {
++	return *_private->proxyRotation;
++}
++
+ void Application::checkProxyRotation(
+ 		not_null<Main::Account*> account,
+ 		int32 state) {
+@@ -1822,6 +1915,222 @@ void Application::refreshGlobalProxy() {
+ 	Sandbox::Instance().refreshGlobalProxy();
+ }
+ 
++void Application::refreshProxyFeed() {
++	if (!sealgramProxyFeedEnabled()) {
++		return;
++	}
++	// Drop what the feed gave us last time if it has aged out, before the
++	// network is even consulted: an expired list must not outlive a feed that
++	// has gone away, and every dead proxy costs a connection timeout at
++	// precisely the moment there is no working connection to spare.
++	pruneExpiredFeedProxies();
++
++	MTP::RequestProxyFeed(crl::guard(this, [=](MTP::ProxyFeedResult result) {
++		if (sealgramProxyFeedEnabled() && !result.empty()) {
++			applyProxyFeed(result);
++		}
++	}));
++}
++
++void Application::checkSealgramUpdate(UpdateCheckSource source) {
++	if (source == UpdateCheckSource::Automatic
++		&& !sealgramUpdateChecksEnabled()) {
++		return;
++	}
++	if (_updateFeedRequestInProgress) {
++		if (source == UpdateCheckSource::Manual) {
++			_updateFeedRequestSource = source;
++		}
++		return;
++	}
++	_updateFeedRequestInProgress = true;
++	_updateFeedRequestSource = source;
++
++	RequestUpdateFeed(crl::guard(this, [=](
++			std::optional<UpdateFeedResult> result) {
++		const auto requestSource = _updateFeedRequestSource;
++		_updateFeedRequestInProgress = false;
++		if (requestSource == UpdateCheckSource::Automatic
++			&& !sealgramUpdateChecksEnabled()) {
++			return;
++		}
++		const auto window = _lastActivePrimaryWindow;
++		if (!window) {
++			return;
++		}
++		if (!result) {
++			if (requestSource == UpdateCheckSource::Manual) {
++				ShowSealgramUpdateResult(window, false);
++			}
++			return;
++		}
++		const auto newer = result->available
++			&& (result->version > AppVersion);
++		if (!newer) {
++			if (requestSource == UpdateCheckSource::Manual) {
++				ShowSealgramUpdateResult(window, true);
++			}
++			return;
++		}
++		if (requestSource == UpdateCheckSource::Automatic
++			&& !ShouldShowUpdate(result->version)) {
++			return;
++		}
++		ShowSealgramUpdate(window, *result);
++	}));
++}
++
++void Application::pruneExpiredFeedProxies() {
++	const auto known = MTP::LoadKnownFeedProxies();
++	if (known.keys.empty()
++		|| !known.expires
++		|| base::unixtime::now() < known.expires) {
++		return;
++	}
++	removeFeedProxies(known.keys);
++	MTP::SaveKnownFeedProxies({});
++	LOG(("Proxy feed: dropped %1 expired entries.").arg(known.keys.size()));
++	saveSettingsDelayed();
++}
++
++void Application::removeFeedProxies(const std::vector<QString> &keys) {
++	auto &proxy = settings().proxy();
++	const auto selected = proxy.selected();
++	for (const auto &key : keys) {
++		const auto separator = key.lastIndexOf(':');
++		if (separator <= 0) {
++			continue;
++		}
++		const auto host = key.mid(0, separator);
++		const auto port = key.mid(separator + 1).toUInt();
++		for (const auto &entry : proxy.list()) {
++			if (entry.type != MTP::ProxyData::Type::Mtproto
++				|| entry.host != host
++				|| entry.port != port) {
++				continue;
++			}
++			// Never pull the rug from under a live connection. If this is the
++			// proxy currently carrying traffic, leave it: rotation will move on
++			// when it stops answering, which is the safe moment to drop it.
++			if (entry != selected) {
++				const auto removed = proxy.removeFromList(entry);
++				Assert(removed);
++			}
++			break;
++		}
++	}
++}
++
++void Application::applyProxyFeed(const MTP::ProxyFeedResult &result) {
++	auto &proxy = settings().proxy();
++	const auto completed = settings().readPref<bool>(
++		kSealgramProxyBootstrapCompleted,
++		false);
++	const auto pending = settings().readPref<bool>(
++		kSealgramProxyBootstrapPending,
++		false);
++	const auto pristine = !proxy.isEnabled() && proxy.list().empty();
++	const auto bootstrap = !completed && (pending || pristine);
++	if (!completed && !pending && !pristine) {
++		// This profile already had an explicit proxy setup when the bootstrap
++		// feature first appeared. Never replace that existing user choice.
++		finishSealgramProxyBootstrap();
++	}
++
++	auto keys = std::vector<QString>();
++	auto fresh = base::flat_set<QString>();
++	keys.reserve(result.proxies.size());
++	for (const auto &entry : result.proxies) {
++		auto key = entry.host + ':' + QString::number(entry.port);
++		fresh.emplace(key);
++		keys.push_back(std::move(key));
++	}
++
++	// Anything the feed served before and no longer serves has fallen out of
++	// the channels, which is the best available signal that it stopped working.
++	auto stale = std::vector<QString>();
++	for (const auto &key : MTP::LoadKnownFeedProxies().keys) {
++		if (!fresh.contains(key)) {
++			stale.push_back(key);
++		}
++	}
++	removeFeedProxies(stale);
++
++	auto added = 0;
++	for (const auto &entry : result.proxies) {
++		if (proxy.indexInList(entry) < 0) {
++			proxy.addToList(entry);
++			++added;
++		}
++	}
++
++	MTP::SaveKnownFeedProxies({ .keys = keys, .expires = result.expires });
++
++	LOG(("Proxy feed: +%1 new, -%2 stale, %3 in the list."
++		).arg(added
++		).arg(stale.size()
++		).arg(proxy.list().size()));
++
++	saveSettingsDelayed();
++
++	if (bootstrap) {
++		settings().writePref<bool>(
++			kSealgramProxyBootstrapPending,
++			true);
++		_private->proxyRotation->bootstrapBestProxy(result.proxies);
++		saveSettingsDelayed();
++		return;
++	}
++
++	// Give the direct connection a fair chance first. Startup is slow, and a
++	// client that flipped to a proxy the moment it opened would be rerouting
++	// traffic for people whose network is perfectly fine.
++	_proxyFallback.callOnce(kProxyFallbackDelay);
++}
++
++void Application::considerProxyFallback() {
++	auto &proxy = settings().proxy();
++	if (!sealgramProxyFeedEnabled()
++		|| proxy.isEnabled()
++		|| proxy.list().empty()) {
++		return; // Already going through a proxy, or nothing to go through.
++	}
++
++	// Step in only when nothing at all is connected. One healthy account means
++	// the network works and there is nothing here to fix.
++	//
++	// Deliberately keyed on the MTProto instance rather than on a session: the
++	// person this is for is most likely sitting on the login screen, unable to
++	// authorise precisely because nothing gets through. Requiring a session
++	// would have skipped them.
++	auto anyProduction = false;
++	for (const auto &entry : domain().accounts()) {
++		const auto account = entry.account.get();
++		if (!account->mtpExists() || account->mtp().isTestMode()) {
++			continue;
++		} else if (account->mtp().dcstate() == MTP::ConnectedState) {
++			return;
++		}
++		anyProduction = true;
++	}
++	if (!anyProduction) {
++		return;
++	}
++
++	// Freshest first, as served. Rotation takes it from here: it probes the
++	// list, measures each candidate and moves on when the current one stops
++	// answering - that is what makes this survive a proxy dying mid-session.
++	proxy.setSelected(proxy.list().front());
++	proxy.setSettings(MTP::ProxyData::Settings::Enabled);
++	proxy.setProxyRotationEnabled(true);
++	proxy.connectionTypeChangesNotify();
++	refreshGlobalProxy();
++	saveSettingsDelayed();
++
++	LOG(("Proxy feed: nothing connected after %1s, enabling a proxy."
++		).arg(kProxyFallbackDelay / 1000));
++}
++
+ void QuitAttempt() {
+ 	const auto savingSession = Sandbox::Instance().isSavingSession();
+ 	if (!IsAppLaunched()
+@@ -1933,7 +2242,7 @@ void Application::RegisterUrlScheme() {
+ 		.arguments = arguments,
+ 		.protocol = u"tg"_q,
+ 		.protocolName = u"Telegram Link"_q,
+-		.shortAppName = u"tdesktop"_q,
++		.shortAppName = u"sealgram"_q,
+ 		.longAppName = QCoreApplication::applicationName(),
+ 		.displayAppName = AppName.utf16(),
+ 		.displayAppDescription = AppName.utf16(),
+@@ -1944,7 +2253,7 @@ void Application::RegisterUrlScheme() {
+ 		.arguments = arguments,
+ 		.protocol = u"tonsite"_q,
+ 		.protocolName = u"TonSite Link"_q,
+-		.shortAppName = u"tdesktop"_q,
++		.shortAppName = u"sealgram"_q,
+ 		.longAppName = QCoreApplication::applicationName(),
+ 		.displayAppName = AppName.utf16(),
+ 		.displayAppDescription = AppName.utf16(),
+diff --git a/Telegram/SourceFiles/core/application.h b/Telegram/SourceFiles/core/application.h
+index 48355e1..b71f010 100644
+--- a/Telegram/SourceFiles/core/application.h
++++ b/Telegram/SourceFiles/core/application.h
+@@ -63,6 +63,7 @@ namespace MTP {
+ class Config;
+ class Instance;
+ class AuthKey;
++struct ProxyFeedResult;
+ using AuthKeyPtr = std::shared_ptr<AuthKey>;
+ using AuthKeysList = std::vector<AuthKeyPtr>;
+ } // namespace MTP
+@@ -114,6 +115,12 @@ namespace Core {
+ struct LocalUrlHandler;
+ class Settings;
+ class Tray;
++class ProxyRotationManager;
++
++enum class UpdateCheckSource {
++	Automatic,
++	Manual,
++};
+ 
+ enum class LaunchState {
+ 	Running,
+@@ -209,6 +216,11 @@ public:
+ 	[[nodiscard]] const Settings &settings() const;
+ 	void saveSettingsDelayed(crl::time delay = kDefaultSaveDelay);
+ 	void saveSettings();
++	[[nodiscard]] bool sealgramProxyFeedEnabled();
++	void setSealgramProxyFeedEnabled(bool enabled);
++	void finishSealgramProxyBootstrap();
++	[[nodiscard]] bool sealgramUpdateChecksEnabled();
++	void setSealgramUpdateChecksEnabled(bool enabled);
+ 
+ 	[[nodiscard]] bool canReadDefaultDownloadPath() const;
+ 	[[nodiscard]] bool canSaveFileWithoutAskingForPath() const;
+@@ -222,6 +234,11 @@ public:
+ 		MTP::ProxyData::Settings settings);
+ 	void proxyRotationSettingsChanged();
+ 	void checkProxyRotation(not_null<Main::Account*> account, int32 state);
++
++	// Exposed for the connection dashboard, which reads measured pings and the
++	// history of automatic switches. Read-only in practice apart from asking
++	// for a fresh round of measurements.
++	[[nodiscard]] ProxyRotationManager &proxyRotation() const;
+ 	[[nodiscard]] rpl::producer<ProxyChange> proxyChanges() const;
+ 	void badMtprotoConfigurationError();
+ 
+@@ -325,6 +342,16 @@ public:
+ 	// Sandbox interface.
+ 	void postponeCall(FnMut<void()> &&callable);
+ 	void refreshGlobalProxy();
++	void checkSealgramUpdate(UpdateCheckSource source);
++
++	// Pulls a signed, freshly dated proxy list over plain HTTPS and keeps the
++	// proxy list in step with it: adds what is new, removes what the feed has
++	// dropped, and clears the lot once it ages out.
++	//
++	// If nothing has connected a while after that, it will enable a proxy on
++	// its own - see considerProxyFallback for exactly when and why.
++	void refreshProxyFeed();
++
+ 	void refreshApplicationIcon();
+ 
+ 	void quitPreventFinished();
+@@ -353,9 +380,23 @@ protected:
+ private:
+ 	static constexpr auto kDefaultSaveDelay = crl::time(1000);
+ 
++	// How long a direct connection gets before the feed's proxies are tried.
++	// Long enough that a slow but working network is never overridden, short
++	// enough that a blocked user is not left staring at "Connecting...".
++	static constexpr auto kProxyFallbackDelay = crl::time(25000);
++
+ 	friend bool IsAppLaunched();
+ 	friend Application &App();
+ 
++	void pruneExpiredFeedProxies();
++	void removeFeedProxies(const std::vector<QString> &keys);
++	void applyProxyFeed(const MTP::ProxyFeedResult &result);
++
++	// Enables a proxy, but only once it is clear nothing else works. Rerouting
++	// someone's traffic is not a decision to take while their connection is
++	// merely slow, so this checks that no account is connected at all first.
++	void considerProxyFallback();
++
+ 	void autoRegisterUrlScheme();
+ 	void clearEmojiSourceImages();
+ 	[[nodiscard]] auto prepareEmojiSourceImages()
+@@ -414,6 +455,7 @@ private:
+ 	const std::unique_ptr<Ui::Animations::Manager> _animationsManager;
+ 	crl::object_on_queue<Stickers::EmojiImageLoader> _emojiImageLoader;
+ 	base::Timer _clearEmojiImageLoaderTimer;
++	base::Timer _proxyFallback;
+ 	const std::unique_ptr<Media::Audio::Instance> _audio;
+ 	mutable std::unique_ptr<MTP::Config> _fallbackProductionConfig;
+ 
+@@ -459,6 +501,9 @@ private:
+ 	crl::time _shouldLockAt = 0;
+ 	base::Timer _autoLockTimer;
+ 
++	UpdateCheckSource _updateFeedRequestSource = UpdateCheckSource::Automatic;
++	bool _updateFeedRequestInProgress = false;
++
+ 	QList<QUrl> _urlsToOpen;
+ 
+ 	std::optional<base::Timer> _saveSettingsTimer;
+diff --git a/Telegram/SourceFiles/main/main_account.h b/Telegram/SourceFiles/main/main_account.h
+index ba09159..711b69c 100644
+--- a/Telegram/SourceFiles/main/main_account.h
++++ b/Telegram/SourceFiles/main/main_account.h
+@@ -81,6 +81,13 @@ public:
+ 	[[nodiscard]] MTP::Instance &mtp() const {
+ 		return *_mtp;
+ 	}
++
++	// mtp() dereferences unconditionally, and the instance only exists between
++	// startMtp() and destroyMtpKeys(). Callers that run outside that window -
++	// anything on a timer, for instance - need to ask first.
++	[[nodiscard]] bool mtpExists() const {
++		return _mtp != nullptr;
++	}
+ 	[[nodiscard]] rpl::producer<not_null<MTP::Instance*>> mtpValue() const;
+ 
+ 	// Each time the main session changes a new copy of the pointer is fired.
+-- 
+2.54.0.windows.1
+

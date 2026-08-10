@@ -1,0 +1,1595 @@
+From bffa85b1dc1cba163503c24fedb034e26fe7f230 Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:33:20 +0300
+Subject: [PATCH 05/13] Add ghost mode, spy mode and ad removal
+
+Ghost mode suppresses read receipts, story views, online status and typing
+progress. Spy mode keeps deleted messages and edit history locally, in the
+account's existing encrypted storage rather than a plaintext database
+beside it. Ads and promotions are dropped before they reach the UI.
+
+Behaviour inspired by AyuGram Desktop 6.7.8. No code was copied; preserve
+both projects' GPL attribution when distributing corresponding source.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Telegram/SourceFiles/api/api_peer_search.cpp  |  14 +
+ .../SourceFiles/api/api_send_progress.cpp     |   6 +
+ Telegram/SourceFiles/api/api_sending.cpp      |   4 +
+ Telegram/SourceFiles/api/api_updates.cpp      |   9 +-
+ Telegram/SourceFiles/api/api_views.cpp        |   5 +-
+ Telegram/SourceFiles/apiwrap.cpp              |  21 +-
+ Telegram/SourceFiles/boxes/send_files_box.cpp |   6 +
+ .../SourceFiles/core/sealgram_privacy.cpp     | 602 ++++++++++++++++++
+ Telegram/SourceFiles/core/sealgram_privacy.h  | 131 ++++
+ .../data/components/promo_suggestions.cpp     |   5 +-
+ .../data/components/sponsored_messages.cpp    |   7 +
+ Telegram/SourceFiles/data/data_histories.cpp  |  31 +-
+ Telegram/SourceFiles/data/data_histories.h    |   8 +-
+ .../SourceFiles/data/data_peer_values.cpp     |  12 +-
+ .../SourceFiles/data/data_replies_list.cpp    |   5 +
+ Telegram/SourceFiles/data/data_session.cpp    |  23 +
+ Telegram/SourceFiles/data/data_stories.cpp    |  16 +
+ Telegram/SourceFiles/data/data_user.cpp       |   5 +-
+ .../history/history_item_helpers.cpp          |   2 +
+ Telegram/SourceFiles/main/main_session.cpp    |   6 +-
+ .../media/view/media_view_overlay_widget.cpp  |   2 +
+ .../SourceFiles/storage/storage_account.cpp   |  38 ++
+ .../SourceFiles/storage/storage_account.h     |   6 +
+ .../SourceFiles/window/window_controller.cpp  |  37 ++
+ 24 files changed, 991 insertions(+), 10 deletions(-)
+ create mode 100644 Telegram/SourceFiles/core/sealgram_privacy.cpp
+ create mode 100644 Telegram/SourceFiles/core/sealgram_privacy.h
+
+diff --git a/Telegram/SourceFiles/api/api_peer_search.cpp b/Telegram/SourceFiles/api/api_peer_search.cpp
+index 73a252a..f29e992 100644
+--- a/Telegram/SourceFiles/api/api_peer_search.cpp
++++ b/Telegram/SourceFiles/api/api_peer_search.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "api/api_peer_search.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "api/api_single_message_search.h"
+ #include "apiwrap.h"
+ #include "data/data_session.h"
+@@ -89,11 +90,24 @@ void PeerSearch::requestPeers() {
+ }
+ 
+ void PeerSearch::requestSponsored() {
++	if (Sealgram::PrivacySettings::Instance().disableAds()) {
++		auto &cache = _cache[_query];
++		cache.sponsoredReady = true;
++		cache.result.sponsored.clear();
++		if (cache.peersReady) {
++			finish(cache.result);
++		}
++		return;
++	}
+ 	const auto requestId = _session->api().request(
+ 		MTPcontacts_GetSponsoredPeers(MTP_string(_query))
+ 	).done([=](
+ 			const MTPcontacts_SponsoredPeers &result,
+ 			mtpRequestId requestId) {
++		if (Sealgram::PrivacySettings::Instance().disableAds()) {
++			finishSponsored(requestId, PeerSearchResult{});
++			return;
++		}
+ 		result.match([&](const MTPDcontacts_sponsoredPeersEmpty &) {
+ 			finishSponsored(requestId, PeerSearchResult{});
+ 		}, [&](const MTPDcontacts_sponsoredPeers &data) {
+diff --git a/Telegram/SourceFiles/api/api_send_progress.cpp b/Telegram/SourceFiles/api/api_send_progress.cpp
+index 206520e..abad884 100644
+--- a/Telegram/SourceFiles/api/api_send_progress.cpp
++++ b/Telegram/SourceFiles/api/api_send_progress.cpp
+@@ -13,6 +13,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "data/data_user.h"
+ #include "base/unixtime.h"
+ #include "data/data_peer_values.h"
++#include "core/sealgram_privacy.h"
+ #include "apiwrap.h"
+ 
+ namespace Api {
+@@ -112,6 +113,11 @@ void SendProgressManager::send(const Key &key, int progress) {
+ 	if (skipRequest(key)) {
+ 		return;
+ 	}
++	if (Sealgram::PrivacySettings::Instance().ghostOption(
++			Sealgram::GhostOption::SendProgress)) {
++		DEBUG_LOG(("Sealgram Privacy: suppressed send progress."));
++		return;
++	}
+ 	using Type = SendProgressType;
+ 	const auto action = [&]() -> MTPsendMessageAction {
+ 		const auto p = MTP_int(progress);
+diff --git a/Telegram/SourceFiles/api/api_sending.cpp b/Telegram/SourceFiles/api/api_sending.cpp
+index de9c87f..56a5a8e 100644
+--- a/Telegram/SourceFiles/api/api_sending.cpp
++++ b/Telegram/SourceFiles/api/api_sending.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "api/api_sending.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "api/api_text_entities.h"
+ #include "base/random.h"
+ #include "base/unixtime.h"
+@@ -183,6 +184,9 @@ void SendExistingMedia(
+ 		Fn<MTPInputMedia()> inputMedia,
+ 		Data::FileOrigin origin,
+ 		std::optional<MsgId> localMessageId) {
++	Sealgram::ApplyGhostScheduling(
++		&message.action.history->session(),
++		message.action.options);
+ 	const auto history = message.action.history;
+ 	const auto peer = history->peer;
+ 	const auto session = &history->session();
+diff --git a/Telegram/SourceFiles/api/api_updates.cpp b/Telegram/SourceFiles/api/api_updates.cpp
+index 162228b..2f708d3 100644
+--- a/Telegram/SourceFiles/api/api_updates.cpp
++++ b/Telegram/SourceFiles/api/api_updates.cpp
+@@ -60,6 +60,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "history/history_streamed_drafts.h"
+ #include "history/history_unread_things.h"
+ #include "core/application.h"
++#include "core/sealgram_privacy.h"
+ #include "storage/storage_account.h"
+ #include "storage/storage_facade.h"
+ #include "storage/storage_user_photos.h"
+@@ -994,7 +995,11 @@ void Updates::updateOnline(crl::time lastNonIdleTime, bool gotOtherOffline) {
+ 	});
+ 
+ 	const auto &config = _session->serverConfig();
+-	bool isOnline = Core::App().hasActiveWindow(&session());
++	const auto isOnlineOriginal = Core::App().hasActiveWindow(&session());
++	const auto &privacy = Sealgram::PrivacySettings::Instance();
++	auto isOnline = isOnlineOriginal
++		&& !privacy.ghostOption(Sealgram::GhostOption::OnlineStatus)
++		&& !privacy.ghostOption(Sealgram::GhostOption::AutomaticOffline);
+ 	int updateIn = config.onlineUpdatePeriod;
+ 	Assert(updateIn >= 0);
+ 	if (isOnline) {
+@@ -1039,7 +1044,7 @@ void Updates::updateOnline(crl::time lastNonIdleTime, bool gotOtherOffline) {
+ 		session().changes().peerUpdated(
+ 			self,
+ 			Data::PeerUpdate::Flag::OnlineStatus);
+-		if (!isOnline) { // Went offline, so we need to save message draft to the cloud.
++		if (!isOnlineOriginal) {
+ 			api().saveCurrentDraftToCloud();
+ 			session().data().maybeStopWatchForOffline(self);
+ 		}
+diff --git a/Telegram/SourceFiles/api/api_views.cpp b/Telegram/SourceFiles/api/api_views.cpp
+index 6e6ac4d..d328a4c 100644
+--- a/Telegram/SourceFiles/api/api_views.cpp
++++ b/Telegram/SourceFiles/api/api_views.cpp
+@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "api/api_views.h"
+ 
+ #include "apiwrap.h"
++#include "core/sealgram_privacy.h"
+ #include "data/data_peer.h"
+ #include "data/data_peer_id.h"
+ #include "data/data_session.h"
+@@ -83,6 +84,8 @@ void ViewsManager::pollExtendedMedia(
+ }
+ 
+ void ViewsManager::viewsIncrement() {
++	const auto increment = !Sealgram::PrivacySettings::Instance().ghostOption(
++		Sealgram::GhostOption::ReadMessages);
+ 	for (auto i = _toIncrement.begin(); i != _toIncrement.cend();) {
+ 		if (_incrementRequests.contains(i->first)) {
+ 			++i;
+@@ -97,7 +100,7 @@ void ViewsManager::viewsIncrement() {
+ 		const auto requestId = _api.request(MTPmessages_GetMessagesViews(
+ 			i->first->input(),
+ 			MTP_vector<MTPint>(ids),
+-			MTP_bool(true)
++			MTP_bool(increment)
+ 		)).done([=](
+ 				const MTPmessages_MessageViews &result,
+ 				mtpRequestId requestId) {
+diff --git a/Telegram/SourceFiles/apiwrap.cpp b/Telegram/SourceFiles/apiwrap.cpp
+index ef14ff5..72f4025 100644
+--- a/Telegram/SourceFiles/apiwrap.cpp
++++ b/Telegram/SourceFiles/apiwrap.cpp
+@@ -32,6 +32,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "api/api_user_privacy.h"
+ #include "api/api_read_metrics.h"
+ #include "api/api_views.h"
++#include "core/sealgram_privacy.h"
+ #include "api/api_confirm_phone.h"
+ #include "api/api_unread_things.h"
+ #include "api/api_ringtones.h"
+@@ -1417,6 +1418,11 @@ void ApiWrap::migrateFail(not_null<PeerData*> peer, const QString &error) {
+ 
+ void ApiWrap::markContentsRead(
+ 		const base::flat_set<not_null<HistoryItem*>> &items) {
++	if (Sealgram::PrivacySettings::Instance().ghostOption(
++			Sealgram::GhostOption::ReadMessages)) {
++		DEBUG_LOG(("Sealgram Privacy: suppressed media read receipts."));
++		return;
++	}
+ 	auto markedIds = QVector<MTPint>();
+ 	auto channelMarkedIds = base::flat_map<
+ 		not_null<ChannelData*>,
+@@ -1448,6 +1454,11 @@ void ApiWrap::markContentsRead(
+ }
+ 
+ void ApiWrap::markContentsRead(not_null<HistoryItem*> item) {
++	if (Sealgram::PrivacySettings::Instance().ghostOption(
++			Sealgram::GhostOption::ReadMessages)) {
++		DEBUG_LOG(("Sealgram Privacy: suppressed media read receipt."));
++		return;
++	}
+ 	if (!item->markContentsRead(true) || !item->isRegular()) {
+ 		return;
+ 	}
+@@ -4113,8 +4124,13 @@ void ApiWrap::sendVoiceMessage(
+ 		crl::time duration,
+ 		bool video,
+ 		const SendAction &action) {
++	auto scheduledAction = action;
++	Sealgram::ApplyGhostScheduling(
++		_session,
++		scheduledAction.options,
++		result.size());
+ 	const auto caption = TextWithTags();
+-	const auto to = FileLoadTaskOptions(action);
++	const auto to = FileLoadTaskOptions(scheduledAction);
+ 	_fileLoader->addTask(
+ 		std::make_unique<FileLoadTask>(FileLoadTask::VoiceArgs{
+ 			.session = &session(),
+@@ -4579,6 +4595,7 @@ void ApiWrap::sendRichMessage(
+ void ApiWrap::sendMessage(
+ 		MessageToSend &&message,
+ 		std::optional<MsgId> localMessageId) {
++	Sealgram::ApplyGhostScheduling(_session, message.action.options);
+ 	const auto history = message.action.history;
+ 	const auto peer = history->peer;
+ 	auto &textWithTags = message.textWithTags;
+@@ -5155,6 +5172,7 @@ void ApiWrap::sendMediaWithRandomId(
+ 		Api::SendOptions options,
+ 		uint64 randomId,
+ 		Fn<void(bool)> done) {
++	Sealgram::ApplyGhostScheduling(_session, options);
+ 	const auto history = item->history();
+ 	const auto replyTo = item->replyTo();
+ 	const auto peer = history->peer;
+@@ -5423,6 +5441,7 @@ void ApiWrap::sendAlbumIfReady(not_null<SendingAlbum*> album) {
+ 		_sendingAlbums.remove(groupId);
+ 		return;
+ 	}
++	Sealgram::ApplyGhostScheduling(_session, album->options);
+ 	const auto history = sample->history();
+ 	const auto sendAs = album->options.sendAs;
+ 	const auto starsPaid = std::min(
+diff --git a/Telegram/SourceFiles/boxes/send_files_box.cpp b/Telegram/SourceFiles/boxes/send_files_box.cpp
+index a2ce41c..53e0105 100644
+--- a/Telegram/SourceFiles/boxes/send_files_box.cpp
++++ b/Telegram/SourceFiles/boxes/send_files_box.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "boxes/send_files_box.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "lang/lang_keys.h"
+ #include "storage/localimageloader.h"
+ #include "storage/localstorage.h"
+@@ -2420,6 +2421,11 @@ bool SendFilesBox::validateLength(const QString &text) const {
+ void SendFilesBox::send(
+ 		Api::SendOptions options,
+ 		bool ctrlShiftEnter) {
++	const auto sumSize = ranges::accumulate(
++		_list.files,
++		int64(0),
++		[](int64 sum, const auto &file) { return sum + file.size; });
++	Sealgram::ApplyGhostScheduling(&_show->session(), options, sumSize);
+ 	if ((_sendType == Api::SendType::Scheduled
+ 		|| _sendType == Api::SendType::ScheduledToUser)
+ 		&& !options.scheduled) {
+diff --git a/Telegram/SourceFiles/core/sealgram_privacy.cpp b/Telegram/SourceFiles/core/sealgram_privacy.cpp
+new file mode 100644
+index 0000000..fee0aed
+--- /dev/null
++++ b/Telegram/SourceFiles/core/sealgram_privacy.cpp
+@@ -0,0 +1,602 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "core/sealgram_privacy.h"
++
++#include "core/application.h"
++#include "core/core_settings.h"
++#include "api/api_common.h"
++#include "base/unixtime.h"
++#include "history/history.h"
++#include "history/history_item.h"
++#include "main/main_session.h"
++#include "storage/storage_account.h"
++#include "data/data_user.h"
++
++#include <bit>
++#include <algorithm>
++#include <cmath>
++#include <QtCore/QBuffer>
++
++namespace Sealgram {
++namespace {
++
++constexpr auto kGhostReadMessages = "sealgram.privacy.ghost-read-messages";
++constexpr auto kGhostReadStories = "sealgram.privacy.ghost-read-stories";
++constexpr auto kGhostOnlineStatus = "sealgram.privacy.ghost-online-status";
++constexpr auto kGhostSendProgress = "sealgram.privacy.ghost-send-progress";
++constexpr auto kGhostAutomaticOffline = "sealgram.privacy.ghost-auto-offline";
++constexpr auto kReadAfterAction = "sealgram.privacy.read-after-action";
++constexpr auto kUseScheduledMessages = "sealgram.privacy.scheduled-messages";
++constexpr auto kSendSilentInGhost = "sealgram.privacy.silent-in-ghost";
++constexpr auto kSendSilentAlways = "sealgram.privacy.silent-always";
++constexpr auto kSuggestGhostForStories = "sealgram.privacy.suggest-story-ghost";
++constexpr auto kSaveDeletedMessages = "sealgram.privacy.save-deleted";
++constexpr auto kSaveEditHistory = "sealgram.privacy.save-edits";
++constexpr auto kSaveBotChats = "sealgram.privacy.save-bots";
++constexpr auto kLocalPremium = "sealgram.privacy.local-premium";
++constexpr auto kDisableAds = "sealgram.privacy.disable-ads";
++constexpr auto kArchiveMagic = quint32(0x53474152); // SGAR
++constexpr auto kArchiveVersion = quint32(1);
++constexpr auto kArchiveMaxRecords = 50000;
++constexpr auto kArchiveSegmentRecords = 512;
++constexpr auto kArchiveMaxSegmentBytes = 4 * 1024 * 1024;
++constexpr auto kArchiveTtl = 90 * 24 * 60 * 60;
++const auto kArchiveManifest = u"sealgram_archive_manifest"_q;
++
++struct ArchiveRecord {
++	ArchiveKind kind = ArchiveKind::Deleted;
++	quint64 peer = 0;
++	qint32 message = 0;
++	quint64 author = 0;
++	qint32 date = 0;
++	qint32 replyTo = 0;
++	qint32 topic = 0;
++	QString text;
++	QString media;
++};
++
++[[nodiscard]] QString ArchiveSegmentName(int index) {
++	return u"sealgram_archive_%1"_q.arg(index, 6, 10, QChar('0'));
++}
++
++void WriteRecord(QDataStream &stream, const ArchiveRecord &record) {
++	stream
++		<< quint8(record.kind)
++		<< record.peer
++		<< record.message
++		<< record.author
++		<< record.date
++		<< record.replyTo
++		<< record.topic
++		<< record.text
++		<< record.media;
++}
++
++[[nodiscard]] bool ReadRecord(
++		QDataStream &stream,
++		ArchiveRecord &record) {
++	auto kind = quint8();
++	stream
++		>> kind
++		>> record.peer
++		>> record.message
++		>> record.author
++		>> record.date
++		>> record.replyTo
++		>> record.topic
++		>> record.text
++		>> record.media;
++	if (stream.status() != QDataStream::Ok
++		|| kind > quint8(ArchiveKind::Edited)) {
++		return false;
++	}
++	record.kind = ArchiveKind(kind);
++	return true;
++}
++
++[[nodiscard]] bool LoadArchive(
++		Storage::Account &storage,
++		std::vector<ArchiveRecord> &records,
++		int &segmentCount) {
++	const auto manifest = storage.readSealgramArchiveFile(kArchiveManifest);
++	if (!manifest) {
++		return !storage.sealgramArchiveFileExists(kArchiveManifest);
++	}
++	auto buffer = QBuffer();
++	buffer.setData(*manifest);
++	buffer.open(QIODevice::ReadOnly);
++	auto stream = QDataStream(&buffer);
++	auto magic = quint32();
++	auto version = quint32();
++	stream >> magic >> version >> segmentCount;
++	if (stream.status() != QDataStream::Ok
++		|| magic != kArchiveMagic
++		|| version != kArchiveVersion
++		|| segmentCount < 0
++		|| segmentCount > 10000) {
++		return false;
++	}
++	for (auto index = 0; index != segmentCount; ++index) {
++		const auto payload = storage.readSealgramArchiveFile(
++			ArchiveSegmentName(index));
++		if (!payload) {
++			return false;
++		}
++		auto segmentBuffer = QBuffer();
++		segmentBuffer.setData(*payload);
++		segmentBuffer.open(QIODevice::ReadOnly);
++		auto segment = QDataStream(&segmentBuffer);
++		auto count = quint32();
++		segment >> count;
++		if (count > kArchiveSegmentRecords) {
++			return false;
++		}
++		for (auto i = quint32(); i != count; ++i) {
++			auto record = ArchiveRecord();
++			if (!ReadRecord(segment, record)) {
++				return false;
++			}
++			records.push_back(std::move(record));
++		}
++		if (segment.status() != QDataStream::Ok) {
++			return false;
++		}
++	}
++	return true;
++}
++
++[[nodiscard]] bool WriteArchive(
++		Storage::Account &storage,
++		const std::vector<ArchiveRecord> &records) {
++	auto segments = std::vector<QByteArray>();
++	auto index = 0;
++	while (index < int(records.size())) {
++		auto payload = QByteArray();
++		auto buffer = QBuffer(&payload);
++		buffer.open(QIODevice::WriteOnly);
++		auto stream = QDataStream(&buffer);
++		const auto countPosition = buffer.pos();
++		stream << quint32(0);
++		auto count = 0;
++		while (index < int(records.size())
++			&& count < kArchiveSegmentRecords) {
++			const auto before = payload.size();
++			WriteRecord(stream, records[index]);
++			if (payload.size() > kArchiveMaxSegmentBytes && count > 0) {
++				payload.truncate(before);
++				buffer.seek(before);
++				break;
++			}
++			++index;
++			++count;
++		}
++		buffer.seek(countPosition);
++		stream << quint32(count);
++		segments.push_back(std::move(payload));
++	}
++	for (auto i = 0; i != int(segments.size()); ++i) {
++		if (!storage.writeSealgramArchiveFile(
++				ArchiveSegmentName(i),
++				segments[i])) {
++			return false;
++		}
++	}
++	auto manifest = QByteArray();
++	auto buffer = QBuffer(&manifest);
++	buffer.open(QIODevice::WriteOnly);
++	auto stream = QDataStream(&buffer);
++	stream
++		<< kArchiveMagic
++		<< kArchiveVersion
++		<< qint32(segments.size());
++	return storage.writeSealgramArchiveFile(kArchiveManifest, manifest);
++}
++constexpr auto kAllGhostOptions = uchar(0x1F);
++
++GhostOptions ReadGhostOptions() {
++	auto result = GhostOptions();
++	const auto add = [&](GhostOption option, const char *key) {
++		if (Core::App().settings().readPref<bool>(key, false)) {
++			result |= option;
++		}
++	};
++	add(GhostOption::ReadMessages, kGhostReadMessages);
++	add(GhostOption::ReadStories, kGhostReadStories);
++	add(GhostOption::OnlineStatus, kGhostOnlineStatus);
++	add(GhostOption::SendProgress, kGhostSendProgress);
++	add(GhostOption::AutomaticOffline, kGhostAutomaticOffline);
++	return result;
++}
++
++SendWithoutSoundMode ReadSendWithoutSound() {
++	auto &settings = Core::App().settings();
++	return settings.readPref<bool>(kSendSilentAlways, false)
++		? SendWithoutSoundMode::Always
++		: settings.readPref<bool>(kSendSilentInGhost, false)
++		? SendWithoutSoundMode::GhostMode
++		: SendWithoutSoundMode::Never;
++}
++
++void WriteGhostOptions(GhostOptions value) {
++	const auto write = [&](GhostOption option, const char *key) {
++		Core::App().settings().writePref<bool>(
++			key,
++			(value & option) != GhostOptions());
++	};
++	write(GhostOption::ReadMessages, kGhostReadMessages);
++	write(GhostOption::ReadStories, kGhostReadStories);
++	write(GhostOption::OnlineStatus, kGhostOnlineStatus);
++	write(GhostOption::SendProgress, kGhostSendProgress);
++	write(GhostOption::AutomaticOffline, kGhostAutomaticOffline);
++}
++
++} // namespace
++
++PrivacySettings &PrivacySettings::Instance() {
++	static auto instance = PrivacySettings();
++	return instance;
++}
++
++PrivacySettings::PrivacySettings()
++: _ghostOptions(ReadGhostOptions())
++, _readAfterAction(Core::App().settings().readPref<bool>(
++	kReadAfterAction,
++	true))
++, _useScheduledMessages(Core::App().settings().readPref<bool>(
++	kUseScheduledMessages,
++	false))
++, _sendWithoutSound(ReadSendWithoutSound())
++, _suggestGhostForStories(Core::App().settings().readPref<bool>(
++	kSuggestGhostForStories,
++	true))
++, _saveDeletedMessages(Core::App().settings().readPref<bool>(
++	kSaveDeletedMessages,
++	true))
++, _saveEditHistory(Core::App().settings().readPref<bool>(
++	kSaveEditHistory,
++	true))
++, _saveBotChats(Core::App().settings().readPref<bool>(
++	kSaveBotChats,
++	false))
++, _localPremium(Core::App().settings().readPref<bool>(
++	kLocalPremium,
++	false))
++, _disableAds(Core::App().settings().readPref<bool>(
++	kDisableAds,
++	true)) {
++	if (_readAfterAction.current() && _useScheduledMessages.current()) {
++		_useScheduledMessages = false;
++		Core::App().settings().writePref<bool>(kUseScheduledMessages, false);
++	}
++}
++
++GhostOptions PrivacySettings::ghostOptions() const {
++	return _ghostOptions.current();
++}
++
++bool PrivacySettings::ghostOption(GhostOption option) const {
++	return (_ghostOptions.current() & option) != GhostOptions();
++}
++
++int PrivacySettings::ghostOptionsCount() const {
++	return std::popcount(uint32(_ghostOptions.current().value()));
++}
++
++bool PrivacySettings::ghostModeEnabled() const {
++	return _ghostOptions.current().value() == kAllGhostOptions;
++}
++
++void PrivacySettings::setGhostOption(GhostOption option, bool enabled) {
++	auto value = _ghostOptions.current();
++	if (enabled) {
++		value |= option;
++	} else {
++		value &= ~GhostOptions(option);
++	}
++	if (value == _ghostOptions.current()) {
++		return;
++	}
++	_ghostOptions = value;
++	WriteGhostOptions(value);
++}
++
++void PrivacySettings::setGhostModeEnabled(bool enabled) {
++	const auto value = GhostOptions::from_raw(
++		enabled ? kAllGhostOptions : uchar(0));
++	if (value == _ghostOptions.current()) {
++		return;
++	}
++	_ghostOptions = value;
++	WriteGhostOptions(value);
++}
++
++rpl::producer<GhostOptions> PrivacySettings::ghostOptionsValue() const {
++	return _ghostOptions.value();
++}
++
++bool PrivacySettings::readAfterAction() const {
++	return _readAfterAction.current();
++}
++
++void PrivacySettings::setReadAfterAction(bool enabled) {
++	if (_readAfterAction.current() == enabled) {
++		return;
++	}
++	_readAfterAction = enabled;
++	Core::App().settings().writePref<bool>(kReadAfterAction, enabled);
++	if (enabled) {
++		setUseScheduledMessages(false);
++	}
++}
++
++rpl::producer<bool> PrivacySettings::readAfterActionValue() const {
++	return _readAfterAction.value();
++}
++
++bool PrivacySettings::useScheduledMessages() const {
++	return _useScheduledMessages.current();
++}
++
++void PrivacySettings::setUseScheduledMessages(bool enabled) {
++	if (_useScheduledMessages.current() == enabled) {
++		return;
++	}
++	_useScheduledMessages = enabled;
++	Core::App().settings().writePref<bool>(kUseScheduledMessages, enabled);
++	if (enabled) {
++		setReadAfterAction(false);
++	}
++}
++
++rpl::producer<bool> PrivacySettings::useScheduledMessagesValue() const {
++	return _useScheduledMessages.value();
++}
++
++SendWithoutSoundMode PrivacySettings::sendWithoutSound() const {
++	return _sendWithoutSound.current();
++}
++
++void PrivacySettings::setSendWithoutSound(SendWithoutSoundMode mode) {
++	if (_sendWithoutSound.current() == mode) {
++		return;
++	}
++	_sendWithoutSound = mode;
++	Core::App().settings().writePref<bool>(
++		kSendSilentInGhost,
++		mode == SendWithoutSoundMode::GhostMode);
++	Core::App().settings().writePref<bool>(
++		kSendSilentAlways,
++		mode == SendWithoutSoundMode::Always);
++}
++
++rpl::producer<SendWithoutSoundMode> PrivacySettings::sendWithoutSoundValue(
++		) const {
++	return _sendWithoutSound.value();
++}
++
++bool PrivacySettings::shouldSendWithoutSound() const {
++	switch (_sendWithoutSound.current()) {
++	case SendWithoutSoundMode::Never:
++		return false;
++	case SendWithoutSoundMode::GhostMode:
++		return ghostModeEnabled();
++	case SendWithoutSoundMode::Always:
++		return true;
++	}
++	Unexpected("SendWithoutSoundMode in shouldSendWithoutSound.");
++}
++
++bool PrivacySettings::suggestGhostForStories() const {
++	return _suggestGhostForStories.current();
++}
++
++void PrivacySettings::setSuggestGhostForStories(bool enabled) {
++	if (_suggestGhostForStories.current() == enabled) {
++		return;
++	}
++	_suggestGhostForStories = enabled;
++	Core::App().settings().writePref<bool>(
++		kSuggestGhostForStories,
++		enabled);
++}
++
++rpl::producer<bool> PrivacySettings::suggestGhostForStoriesValue() const {
++	return _suggestGhostForStories.value();
++}
++
++bool PrivacySettings::saveDeletedMessages() const {
++	return _saveDeletedMessages.current();
++}
++
++void PrivacySettings::setSaveDeletedMessages(bool enabled) {
++	if (_saveDeletedMessages.current() == enabled) {
++		return;
++	}
++	_saveDeletedMessages = enabled;
++	Core::App().settings().writePref<bool>(kSaveDeletedMessages, enabled);
++}
++
++rpl::producer<bool> PrivacySettings::saveDeletedMessagesValue() const {
++	return _saveDeletedMessages.value();
++}
++
++bool PrivacySettings::saveEditHistory() const {
++	return _saveEditHistory.current();
++}
++
++void PrivacySettings::setSaveEditHistory(bool enabled) {
++	if (_saveEditHistory.current() == enabled) {
++		return;
++	}
++	_saveEditHistory = enabled;
++	Core::App().settings().writePref<bool>(kSaveEditHistory, enabled);
++}
++
++rpl::producer<bool> PrivacySettings::saveEditHistoryValue() const {
++	return _saveEditHistory.value();
++}
++
++bool PrivacySettings::saveBotChats() const {
++	return _saveBotChats.current();
++}
++
++void PrivacySettings::setSaveBotChats(bool enabled) {
++	if (_saveBotChats.current() == enabled) {
++		return;
++	}
++	_saveBotChats = enabled;
++	Core::App().settings().writePref<bool>(kSaveBotChats, enabled);
++}
++
++rpl::producer<bool> PrivacySettings::saveBotChatsValue() const {
++	return _saveBotChats.value();
++}
++
++bool PrivacySettings::localPremium() const {
++	return _localPremium.current();
++}
++
++void PrivacySettings::setLocalPremium(bool enabled) {
++	if (_localPremium.current() == enabled) {
++		return;
++	}
++	_localPremium = enabled;
++	Core::App().settings().writePref<bool>(kLocalPremium, enabled);
++}
++
++rpl::producer<bool> PrivacySettings::localPremiumValue() const {
++	return _localPremium.value();
++}
++
++bool PrivacySettings::disableAds() const {
++	return _disableAds.current();
++}
++
++void PrivacySettings::setDisableAds(bool enabled) {
++	if (_disableAds.current() == enabled) {
++		return;
++	}
++	_disableAds = enabled;
++	Core::App().settings().writePref<bool>(kDisableAds, enabled);
++}
++
++rpl::producer<bool> PrivacySettings::disableAdsValue() const {
++	return _disableAds.value();
++}
++
++void PrivacySettings::beginTemporaryStoryGhost() {
++	if (!_storyRestoreOptions) {
++		_storyRestoreOptions = _ghostOptions.current();
++	}
++	setGhostModeEnabled(true);
++}
++
++void PrivacySettings::finishTemporaryStoryGhost() {
++	if (!_storyRestoreOptions) {
++		return;
++	}
++	const auto restore = *_storyRestoreOptions;
++	_storyRestoreOptions = std::nullopt;
++	if (_ghostOptions.current() == restore) {
++		return;
++	}
++	_ghostOptions = restore;
++	WriteGhostOptions(restore);
++}
++
++int GhostScheduleDelay(int64 sizeBytes, bool usingProxy) {
++	auto result = 12;
++	if (sizeBytes > 0) {
++		const auto sizeMegabytes = sizeBytes / 1024. / 1024.;
++		result += int(std::ceil(std::max(
++			6.,
++			std::ceil(sizeMegabytes * 0.7)))) + 1;
++	}
++	return usingProxy ? ((result * 6 + 4) / 5) : result;
++}
++
++void ApplyGhostScheduling(
++		not_null<Main::Session*> session,
++		Api::SendOptions &options,
++		int64 sizeBytes) {
++	const auto &privacy = PrivacySettings::Instance();
++	if (!privacy.ghostModeEnabled()
++		|| !privacy.useScheduledMessages()
++		|| options.scheduled) {
++		return;
++	}
++	const auto delay = GhostScheduleDelay(
++		sizeBytes,
++		Core::App().settings().proxy().isEnabled());
++	options.scheduled = base::unixtime::now() + delay;
++}
++
++void ArchiveMessageVersion(
++		not_null<Main::Session*> session,
++		not_null<HistoryItem*> item,
++		ArchiveKind kind) {
++	const auto &privacy = PrivacySettings::Instance();
++	if ((kind == ArchiveKind::Deleted && !privacy.saveDeletedMessages())
++		|| (kind == ArchiveKind::Edited && !privacy.saveEditHistory())) {
++		return;
++	}
++	const auto peer = item->history()->peer;
++	if (!privacy.saveBotChats()) {
++		if (const auto user = peer->asUser(); user && user->isBot()) {
++			return;
++		}
++	}
++
++	auto records = std::vector<ArchiveRecord>();
++	auto previousSegments = 0;
++	auto &storage = session->local();
++	if (!LoadArchive(storage, records, previousSegments)) {
++		LOG(("Sealgram archive: refusing to overwrite unreadable archive."));
++		return;
++	}
++	const auto fullId = item->fullId();
++	records.push_back({
++		.kind = kind,
++		.peer = quint64(fullId.peer.value),
++		.message = qint32(fullId.msg.bare),
++		.author = quint64(item->from()->id.value),
++		.date = qint32(item->date()),
++		.replyTo = qint32(item->replyToId().bare),
++		.topic = qint32(item->topicRootId().bare),
++		.text = item->originalText().text,
++		.media = item->media() ? u"cached-media"_q : QString(),
++	});
++
++	const auto oldest = base::unixtime::now() - kArchiveTtl;
++	records.erase(
++		std::remove_if(
++			begin(records),
++			end(records),
++			[=](const ArchiveRecord &record) {
++				return record.date < oldest;
++			}),
++		end(records));
++	if (records.size() > kArchiveMaxRecords) {
++		records.erase(
++			begin(records),
++			begin(records) + (records.size() - kArchiveMaxRecords));
++	}
++	if (!WriteArchive(storage, records)) {
++		LOG(("Sealgram archive: write failed."));
++	}
++}
++
++void ClearPrivacyArchive(not_null<Main::Session*> session) {
++	auto &storage = session->local();
++	auto records = std::vector<ArchiveRecord>();
++	if (!WriteArchive(storage, records)) {
++		LOG(("Sealgram archive: clear failed."));
++	}
++}
++
++} // namespace Sealgram
+diff --git a/Telegram/SourceFiles/core/sealgram_privacy.h b/Telegram/SourceFiles/core/sealgram_privacy.h
+new file mode 100644
+index 0000000..91d1b10
+--- /dev/null
++++ b/Telegram/SourceFiles/core/sealgram_privacy.h
+@@ -0,0 +1,131 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include "base/flags.h"
++#include "rpl/variable.h"
++
++#include <optional>
++
++namespace Api {
++struct SendOptions;
++} // namespace Api
++
++namespace Main {
++class Session;
++} // namespace Main
++
++class HistoryItem;
++
++namespace Sealgram {
++
++enum class GhostOption : uchar {
++	ReadMessages = (1U << 0),
++	ReadStories = (1U << 1),
++	OnlineStatus = (1U << 2),
++	SendProgress = (1U << 3),
++	AutomaticOffline = (1U << 4),
++};
++using GhostOptions = base::flags<GhostOption>;
++
++inline constexpr bool is_flag_type(GhostOption) {
++	return true;
++}
++
++enum class SendWithoutSoundMode : uchar {
++	Never = 0,
++	GhostMode = 1,
++	Always = 2,
++};
++
++class PrivacySettings final {
++public:
++	[[nodiscard]] static PrivacySettings &Instance();
++
++	[[nodiscard]] GhostOptions ghostOptions() const;
++	[[nodiscard]] bool ghostOption(GhostOption option) const;
++	[[nodiscard]] int ghostOptionsCount() const;
++	[[nodiscard]] bool ghostModeEnabled() const;
++	void setGhostOption(GhostOption option, bool enabled);
++	void setGhostModeEnabled(bool enabled);
++	[[nodiscard]] rpl::producer<GhostOptions> ghostOptionsValue() const;
++
++	[[nodiscard]] bool readAfterAction() const;
++	void setReadAfterAction(bool enabled);
++	[[nodiscard]] rpl::producer<bool> readAfterActionValue() const;
++
++	[[nodiscard]] bool useScheduledMessages() const;
++	void setUseScheduledMessages(bool enabled);
++	[[nodiscard]] rpl::producer<bool> useScheduledMessagesValue() const;
++
++	[[nodiscard]] SendWithoutSoundMode sendWithoutSound() const;
++	void setSendWithoutSound(SendWithoutSoundMode mode);
++	[[nodiscard]] rpl::producer<SendWithoutSoundMode> sendWithoutSoundValue() const;
++	[[nodiscard]] bool shouldSendWithoutSound() const;
++
++	[[nodiscard]] bool suggestGhostForStories() const;
++	void setSuggestGhostForStories(bool enabled);
++	[[nodiscard]] rpl::producer<bool> suggestGhostForStoriesValue() const;
++
++	[[nodiscard]] bool saveDeletedMessages() const;
++	void setSaveDeletedMessages(bool enabled);
++	[[nodiscard]] rpl::producer<bool> saveDeletedMessagesValue() const;
++
++	[[nodiscard]] bool saveEditHistory() const;
++	void setSaveEditHistory(bool enabled);
++	[[nodiscard]] rpl::producer<bool> saveEditHistoryValue() const;
++
++	[[nodiscard]] bool saveBotChats() const;
++	void setSaveBotChats(bool enabled);
++	[[nodiscard]] rpl::producer<bool> saveBotChatsValue() const;
++
++	[[nodiscard]] bool localPremium() const;
++	void setLocalPremium(bool enabled);
++	[[nodiscard]] rpl::producer<bool> localPremiumValue() const;
++
++	[[nodiscard]] bool disableAds() const;
++	void setDisableAds(bool enabled);
++	[[nodiscard]] rpl::producer<bool> disableAdsValue() const;
++
++	void beginTemporaryStoryGhost();
++	void finishTemporaryStoryGhost();
++
++private:
++	PrivacySettings();
++
++	rpl::variable<GhostOptions> _ghostOptions;
++	rpl::variable<bool> _readAfterAction;
++	rpl::variable<bool> _useScheduledMessages;
++	rpl::variable<SendWithoutSoundMode> _sendWithoutSound;
++	rpl::variable<bool> _suggestGhostForStories;
++	rpl::variable<bool> _saveDeletedMessages;
++	rpl::variable<bool> _saveEditHistory;
++	rpl::variable<bool> _saveBotChats;
++	rpl::variable<bool> _localPremium;
++	rpl::variable<bool> _disableAds;
++	std::optional<GhostOptions> _storyRestoreOptions;
++};
++
++[[nodiscard]] int GhostScheduleDelay(int64 sizeBytes, bool usingProxy);
++void ApplyGhostScheduling(
++	not_null<Main::Session*> session,
++	Api::SendOptions &options,
++	int64 sizeBytes = 0);
++
++enum class ArchiveKind : uchar {
++	Deleted,
++	Edited,
++};
++
++void ArchiveMessageVersion(
++	not_null<Main::Session*> session,
++	not_null<HistoryItem*> item,
++	ArchiveKind kind);
++void ClearPrivacyArchive(not_null<Main::Session*> session);
++
++} // namespace Sealgram
+diff --git a/Telegram/SourceFiles/data/components/promo_suggestions.cpp b/Telegram/SourceFiles/data/components/promo_suggestions.cpp
+index 6a0e5bc..ec8fb73 100644
+--- a/Telegram/SourceFiles/data/components/promo_suggestions.cpp
++++ b/Telegram/SourceFiles/data/components/promo_suggestions.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "data/components/promo_suggestions.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "api/api_text_entities.h"
+ #include "apiwrap.h"
+ #include "base/unixtime.h"
+@@ -130,7 +131,9 @@ void PromoSuggestions::refreshTopPromotion() {
+ 					|= _dismissedSuggestions.emplace(qs(suggestion)).second;
+ 			}
+ 
+-			if (const auto peer = data.vpeer()) {
++			if (Sealgram::PrivacySettings::Instance().disableAds()) {
++				setTopPromoted(nullptr, QString(), QString());
++			} else if (const auto peer = data.vpeer()) {
+ 				const auto peerId = peerFromMTP(*peer);
+ 				const auto history = _session->data().history(peerId);
+ 				setTopPromoted(
+diff --git a/Telegram/SourceFiles/data/components/sponsored_messages.cpp b/Telegram/SourceFiles/data/components/sponsored_messages.cpp
+index 40c00c4..c8c19a2 100644
+--- a/Telegram/SourceFiles/data/components/sponsored_messages.cpp
++++ b/Telegram/SourceFiles/data/components/sponsored_messages.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "data/components/sponsored_messages.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "api/api_text_entities.h"
+ #include "api/api_peer_search.h" // SponsoredSearchResult
+ #include "apiwrap.h"
+@@ -239,6 +240,9 @@ void SponsoredMessages::inject(
+ }
+ 
+ bool SponsoredMessages::canHaveFor(not_null<History*> history) const {
++	if (Sealgram::PrivacySettings::Instance().disableAds()) {
++		return false;
++	}
+ 	if (history->peer->isChannel()) {
+ 		return true;
+ 	} else if (const auto user = history->peer->asUser()) {
+@@ -248,6 +252,9 @@ bool SponsoredMessages::canHaveFor(not_null<History*> history) const {
+ }
+ 
+ bool SponsoredMessages::canHaveFor(not_null<HistoryItem*> item) const {
++	if (Sealgram::PrivacySettings::Instance().disableAds()) {
++		return false;
++	}
+ 	return item->history()->peer->isBroadcast()
+ 		&& item->isRegular();
+ }
+diff --git a/Telegram/SourceFiles/data/data_histories.cpp b/Telegram/SourceFiles/data/data_histories.cpp
+index 22f4545..c0519fe 100644
+--- a/Telegram/SourceFiles/data/data_histories.cpp
++++ b/Telegram/SourceFiles/data/data_histories.cpp
+@@ -30,6 +30,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "history/history_item_helpers.h"
+ #include "history/view/history_view_element.h"
+ #include "core/application.h"
++#include "core/sealgram_privacy.h"
+ #include "apiwrap.h"
+ 
+ namespace Data {
+@@ -243,10 +244,22 @@ void Histories::readInboxTill(not_null<History*> history, MsgId tillId) {
+ 	readInboxTill(history, tillId, false);
+ }
+ 
++void Histories::readInboxAfterAction(not_null<History*> history) {
++	const auto &privacy = Sealgram::PrivacySettings::Instance();
++	if (!privacy.ghostOption(Sealgram::GhostOption::ReadMessages)
++		|| !privacy.readAfterAction()) {
++		return;
++	}
++	if (const auto last = history->lastServerMessage()) {
++		readInboxTill(history, last->id, true, true);
++	}
++}
++
+ void Histories::readInboxTill(
+ 		not_null<History*> history,
+ 		MsgId tillId,
+-		bool force) {
++		bool force,
++		bool explicitAction) {
+ 	Expects(IsServerMsgId(tillId) || (!tillId && !force));
+ 
+ 	DEBUG_LOG(("Reading: readInboxTill %1, force %2."
+@@ -281,6 +294,9 @@ void Histories::readInboxTill(
+ 		return;
+ 	}
+ 	const auto maybeState = lookup(history);
++	if (maybeState && explicitAction) {
++		maybeState->explicitRead = true;
++	}
+ 	if (maybeState && maybeState->sentReadTill >= tillId) {
+ 		DEBUG_LOG(("Reading: readInboxTill finish 3 with %1."
+ 			).arg(maybeState->sentReadTill.bare));
+@@ -308,6 +324,7 @@ void Histories::readInboxTill(
+ 		return;
+ 	}
+ 	auto &state = maybeState ? *maybeState : _states[history];
++	state.explicitRead = state.explicitRead || explicitAction;
+ 	state.willReadTill = tillId;
+ 	if (force || !stillUnread || !*stillUnread) {
+ 		DEBUG_LOG(("Reading: will read till %1 with still unread %2"
+@@ -685,6 +702,16 @@ void Histories::reportPendingDeliveries() {
+ 
+ void Histories::sendReadRequests() {
+ 	DEBUG_LOG(("Reading: send requests with count %1.").arg(_states.size()));
++	if (Sealgram::PrivacySettings::Instance().ghostOption(
++			Sealgram::GhostOption::ReadMessages)) {
++		for (auto &[history, state] : _states) {
++			if (!state.explicitRead) {
++				state.willReadTill = 0;
++				state.willReadWhen = 0;
++			}
++		}
++		DEBUG_LOG(("Sealgram Privacy: suppressed queued automatic reads."));
++	}
+ 	if (_states.empty()) {
+ 		return;
+ 	}
+@@ -714,6 +741,7 @@ void Histories::sendReadRequest(not_null<History*> history, State &state) {
+ 	Expects(state.willReadTill > state.sentReadTill);
+ 
+ 	const auto tillId = state.sentReadTill = base::take(state.willReadTill);
++	state.explicitRead = false;
+ 	state.willReadWhen = 0;
+ 	state.sentReadDone = false;
+ 	DEBUG_LOG(("Reading: sending request now with till %1."
+@@ -1107,6 +1135,7 @@ int Histories::sendPreparedMessage(
+ 		Fn<PreparedMessage(not_null<History*>, FullReplyTo)> message,
+ 		Fn<void(const MTPUpdates&, const MTP::Response&)> done,
+ 		Fn<void(const MTP::Error&, const MTP::Response&)> fail) {
++	readInboxAfterAction(history);
+ 	if (isCreatingTopic(history, replyTo.topicRootId)) {
+ 		const auto id = ++_requestAutoincrement;
+ 		const auto creatingId = FullMsgId(
+diff --git a/Telegram/SourceFiles/data/data_histories.h b/Telegram/SourceFiles/data/data_histories.h
+index 773dec1..7780848 100644
+--- a/Telegram/SourceFiles/data/data_histories.h
++++ b/Telegram/SourceFiles/data/data_histories.h
+@@ -61,6 +61,7 @@ public:
+ 	void readInbox(not_null<History*> history);
+ 	void readInboxTill(not_null<HistoryItem*> item);
+ 	void readInboxTill(not_null<History*> history, MsgId tillId);
++	void readInboxAfterAction(not_null<History*> history);
+ 	void readInboxOnNewMessage(not_null<HistoryItem*> item);
+ 	void readClientSideMessage(not_null<HistoryItem*> item);
+ 	void sendPendingReadInbox(not_null<History*> history);
+@@ -158,6 +159,7 @@ private:
+ 		crl::time willReadWhen = 0;
+ 		bool sentReadDone = false;
+ 		bool postponedRequestEntry = false;
++		bool explicitRead = false;
+ 	};
+ 	struct ChatListGroupRequest {
+ 		MsgId aroundId = 0;
+@@ -192,7 +194,11 @@ private:
+ 		}
+ 	}
+ 
+-	void readInboxTill(not_null<History*> history, MsgId tillId, bool force);
++	void readInboxTill(
++		not_null<History*> history,
++		MsgId tillId,
++		bool force,
++		bool explicitAction = false);
+ 	void sendReadRequests();
+ 	void sendReadRequest(not_null<History*> history, State &state);
+ 	[[nodiscard]] State *lookup(not_null<History*> history);
+diff --git a/Telegram/SourceFiles/data/data_peer_values.cpp b/Telegram/SourceFiles/data/data_peer_values.cpp
+index 2e8ee8c..128f2fd 100644
+--- a/Telegram/SourceFiles/data/data_peer_values.cpp
++++ b/Telegram/SourceFiles/data/data_peer_values.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "data/data_peer_values.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "lang/lang_keys.h"
+ #include "data/data_channel.h"
+ #include "data/data_chat.h"
+@@ -395,12 +396,21 @@ rpl::producer<bool> PeerPremiumValue(not_null<PeerData*> peer) {
+ 	if (!user) {
+ 		return rpl::single(false);
+ 	}
+-	return user->flagsValue(
++	auto server = user->flagsValue(
+ 	) | rpl::filter([=](UserData::Flags::Change change) {
+ 		return (change.diff & UserDataFlag::Premium);
+ 	}) | rpl::map([=] {
+ 		return user->isPremium();
+ 	});
++	if (!user->isSelf()) {
++		return server;
++	}
++	return rpl::combine(
++		std::move(server),
++		Sealgram::PrivacySettings::Instance().localPremiumValue(),
++		[](bool premium, bool localPremium) {
++			return premium || localPremium;
++		});
+ }
+ 
+ rpl::producer<bool> AmPremiumValue(not_null<Main::Session*> session) {
+diff --git a/Telegram/SourceFiles/data/data_replies_list.cpp b/Telegram/SourceFiles/data/data_replies_list.cpp
+index 4bf7d11..ad22320 100644
+--- a/Telegram/SourceFiles/data/data_replies_list.cpp
++++ b/Telegram/SourceFiles/data/data_replies_list.cpp
+@@ -20,6 +20,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "data/data_forum_topic.h"
+ #include "window/notifications_manager.h"
+ #include "core/application.h"
++#include "core/sealgram_privacy.h"
+ #include "lang/lang_keys.h"
+ #include "apiwrap.h"
+ 
+@@ -1002,6 +1003,10 @@ void RepliesList::sendReadTillRequest() {
+ 	if (_readRequestTimer.isActive()) {
+ 		_readRequestTimer.cancel();
+ 	}
++	if (Sealgram::PrivacySettings::Instance().ghostOption(
++			Sealgram::GhostOption::ReadMessages)) {
++		return;
++	}
+ 	const auto api = &_history->session().api();
+ 	api->request(base::take(_readRequestId)).cancel();
+ 
+diff --git a/Telegram/SourceFiles/data/data_session.cpp b/Telegram/SourceFiles/data/data_session.cpp
+index 43e3536..bf00c33 100644
+--- a/Telegram/SourceFiles/data/data_session.cpp
++++ b/Telegram/SourceFiles/data/data_session.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "data/data_session.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "main/main_session.h"
+ #include "main/main_session_settings.h"
+ #include "main/main_app_config.h"
+@@ -2879,6 +2880,10 @@ void Session::updateEditedMessage(const MTPMessage &data) {
+ 		Reactions::CheckUnknownForUnread(this, data);
+ 		return;
+ 	}
++	Sealgram::ArchiveMessageVersion(
++		_session,
++		existing,
++		Sealgram::ArchiveKind::Edited);
+ 	if (existing->isLocalUpdateMedia() && data.type() == mtpc_message) {
+ 		updateExistingMessage(data.c_message());
+ 	}
+@@ -3025,6 +3030,12 @@ void Session::checkTTLs() {
+ 		expired.insert(expired.end(), items.begin(), items.end());
+ 	}
+ 	if (!expired.empty()) {
++		for (const auto &item : expired) {
++			Sealgram::ArchiveMessageVersion(
++				_session,
++				item,
++				Sealgram::ArchiveKind::Deleted);
++		}
+ 		notifyItemsAboutToBeDestroyed(expired);
+ 		for (const auto &item : expired) {
+ 			item->destroy();
+@@ -3098,6 +3109,12 @@ void Session::processMessagesDeleted(
+ 		}
+ 	}
+ 	if (!toDestroy.empty()) {
++		for (const auto &item : toDestroy) {
++			Sealgram::ArchiveMessageVersion(
++				_session,
++				item,
++				Sealgram::ArchiveKind::Deleted);
++		}
+ 		notifyItemsAboutToBeDestroyed(toDestroy);
+ 		for (const auto &item : toDestroy) {
+ 			item->destroy();
+@@ -3121,6 +3138,12 @@ void Session::processNonChannelMessagesDeleted(const QVector<MTPint> &data) {
+ 		}
+ 	}
+ 	if (!toDestroy.empty()) {
++		for (const auto &item : toDestroy) {
++			Sealgram::ArchiveMessageVersion(
++				_session,
++				item,
++				Sealgram::ArchiveKind::Deleted);
++		}
+ 		notifyItemsAboutToBeDestroyed(toDestroy);
+ 		for (const auto &item : toDestroy) {
+ 			item->destroy();
+diff --git a/Telegram/SourceFiles/data/data_stories.cpp b/Telegram/SourceFiles/data/data_stories.cpp
+index 232f352..97b2a91 100644
+--- a/Telegram/SourceFiles/data/data_stories.cpp
++++ b/Telegram/SourceFiles/data/data_stories.cpp
+@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "base/unixtime.h"
+ #include "apiwrap.h"
+ #include "core/application.h"
++#include "core/sealgram_privacy.h"
+ #include "data/components/top_peers.h"
+ #include "data/data_changes.h"
+ #include "data/data_channel.h"
+@@ -1236,6 +1237,11 @@ void Stories::markAsRead(FullStoryId id, bool viewed) {
+ 	if (id.peer == _owner->session().userPeerId()) {
+ 		return;
+ 	}
++	if (Sealgram::PrivacySettings::Instance().ghostOption(
++			Sealgram::GhostOption::ReadStories)) {
++		DEBUG_LOG(("Sealgram Privacy: suppressed story view."));
++		return;
++	}
+ 	const auto maybeStory = lookup(id);
+ 	if (!maybeStory) {
+ 		return;
+@@ -1423,6 +1429,11 @@ void Stories::checkQuitPreventFinished() {
+ 
+ void Stories::sendMarkAsReadRequests() {
+ 	_markReadTimer.cancel();
++	if (Sealgram::PrivacySettings::Instance().ghostOption(
++			Sealgram::GhostOption::ReadStories)) {
++		_markReadPending.clear();
++		return;
++	}
+ 	for (auto i = begin(_markReadPending); i != end(_markReadPending);) {
+ 		const auto peerId = *i;
+ 		if (_markReadRequests.contains(peerId)) {
+@@ -1438,6 +1449,11 @@ void Stories::sendMarkAsReadRequests() {
+ }
+ 
+ void Stories::sendIncrementViewsRequests() {
++	if (Sealgram::PrivacySettings::Instance().ghostOption(
++			Sealgram::GhostOption::ReadStories)) {
++		_incrementViewsPending.clear();
++		return;
++	}
+ 	if (_incrementViewsPending.empty()) {
+ 		return;
+ 	}
+diff --git a/Telegram/SourceFiles/data/data_user.cpp b/Telegram/SourceFiles/data/data_user.cpp
+index 74fb183..15eb01d 100644
+--- a/Telegram/SourceFiles/data/data_user.cpp
++++ b/Telegram/SourceFiles/data/data_user.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "data/data_user.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "api/api_credits.h"
+ #include "api/api_global_privacy.h"
+ #include "api/api_sensitive_content.h"
+@@ -609,7 +610,9 @@ bool UserData::isFake() const {
+ }
+ 
+ bool UserData::isPremium() const {
+-	return flags() & UserDataFlag::Premium;
++	return (flags() & UserDataFlag::Premium)
++		|| (isSelf()
++			&& Sealgram::PrivacySettings::Instance().localPremium());
+ }
+ 
+ bool UserData::isBotInlineGeo() const {
+diff --git a/Telegram/SourceFiles/history/history_item_helpers.cpp b/Telegram/SourceFiles/history/history_item_helpers.cpp
+index f2dbf30..3257749 100644
+--- a/Telegram/SourceFiles/history/history_item_helpers.cpp
++++ b/Telegram/SourceFiles/history/history_item_helpers.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "history/history_item_helpers.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "api/api_reactions_notify_settings.h"
+ #include "api/api_text_entities.h"
+ #include "boxes/premium_preview_box.h"
+@@ -622,6 +623,7 @@ bool ShouldSendSilent(
+ 		not_null<PeerData*> peer,
+ 		const Api::SendOptions &options) {
+ 	return options.silent
++		|| Sealgram::PrivacySettings::Instance().shouldSendWithoutSound()
+ 		|| (peer->isBroadcast()
+ 			&& peer->owner().notifySettings().silentPosts(peer))
+ 		|| (peer->session().supportMode()
+diff --git a/Telegram/SourceFiles/main/main_session.cpp b/Telegram/SourceFiles/main/main_session.cpp
+index 5191a6d..fd57177 100644
+--- a/Telegram/SourceFiles/main/main_session.cpp
++++ b/Telegram/SourceFiles/main/main_session.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "main/main_session.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "apiwrap.h"
+ #include "api/api_peer_colors.h"
+ #include "api/api_updates.h"
+@@ -366,7 +367,10 @@ rpl::producer<bool> Session::premiumPossibleValue() const {
+ 	return rpl::combine(
+ 		std::move(premium),
+ 		_premiumPossible.value(),
+-		_1 || _2);
++		Sealgram::PrivacySettings::Instance().localPremiumValue(),
++		[](bool serverPremium, bool canBuy, bool localPremium) {
++			return serverPremium || canBuy || localPremium;
++		});
+ }
+ 
+ bool Session::premiumCanBuy() const {
+diff --git a/Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp b/Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp
+index d94bfb7..c049573 100644
+--- a/Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp
++++ b/Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp
+@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "media/view/media_view_overlay_widget.h"
+ 
++#include "core/sealgram_privacy.h"
+ #include "apiwrap.h"
+ #include "api/api_attached_stickers.h"
+ #include "api/api_peer_photo.h"
+@@ -8561,6 +8562,7 @@ Window::SessionController *OverlayWidget::findWindow(bool switchTo) const {
+ 
+ // #TODO unite and check
+ void OverlayWidget::clearBeforeHide() {
++	Sealgram::PrivacySettings::Instance().finishTemporaryStoryGhost();
+ 	_message = nullptr;
+ 	_sharedMedia = nullptr;
+ 	_sharedMediaData = std::nullopt;
+diff --git a/Telegram/SourceFiles/storage/storage_account.cpp b/Telegram/SourceFiles/storage/storage_account.cpp
+index 10b6742..536b9bd 100644
+--- a/Telegram/SourceFiles/storage/storage_account.cpp
++++ b/Telegram/SourceFiles/storage/storage_account.cpp
+@@ -42,6 +42,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "webview/webview_interface.h"
+ #include "window/themes/window_theme.h"
+ 
++#include <QtCore/QFileInfo>
++
+ namespace Storage {
+ namespace {
+ 
+@@ -169,6 +171,42 @@ auto EmptyMessageDraftSources()
+ 
+ } // namespace
+ 
++std::optional<QByteArray> Account::readSealgramArchiveFile(
++		const QString &name) const {
++	if (!_localKey) {
++		return std::nullopt;
++	}
++	auto file = details::FileReadDescriptor();
++	if (!details::ReadEncryptedFile(file, name, _basePath, _localKey)) {
++		return std::nullopt;
++	}
++	auto payload = QByteArray();
++	file.stream >> payload;
++	if (!details::CheckStreamStatus(file.stream)) {
++		return std::nullopt;
++	}
++	return payload;
++}
++
++bool Account::sealgramArchiveFileExists(const QString &name) const {
++	return QFileInfo::exists(_basePath + name + '0')
++		|| QFileInfo::exists(_basePath + name + '1')
++		|| QFileInfo::exists(_basePath + name);
++}
++
++bool Account::writeSealgramArchiveFile(
++		const QString &name,
++		const QByteArray &payload) {
++	if (!_localKey) {
++		return false;
++	}
++	auto data = details::EncryptedDescriptor(Serialize::bytearraySize(payload));
++	data.stream << payload;
++	auto file = details::FileWriteDescriptor(name, _basePath, true);
++	file.writeEncrypted(data, _localKey);
++	return true;
++}
++
+ Account::Account(not_null<Main::Account*> owner, const QString &dataName)
+ : _owner(owner)
+ , _dataName(dataName)
+diff --git a/Telegram/SourceFiles/storage/storage_account.h b/Telegram/SourceFiles/storage/storage_account.h
+index a35dcac..b8d1b0b 100644
+--- a/Telegram/SourceFiles/storage/storage_account.h
++++ b/Telegram/SourceFiles/storage/storage_account.h
+@@ -82,6 +82,12 @@ public:
+ 	[[nodiscard]] MTP::AuthKeyPtr peekLegacyLocalKey() const {
+ 		return _localKey;
+ 	}
++	[[nodiscard]] std::optional<QByteArray> readSealgramArchiveFile(
++		const QString &name) const;
++	[[nodiscard]] bool sealgramArchiveFileExists(const QString &name) const;
++	bool writeSealgramArchiveFile(
++		const QString &name,
++		const QByteArray &payload);
+ 
+ 	void writeSessionSettings();
+ 	void writeMtpData();
+diff --git a/Telegram/SourceFiles/window/window_controller.cpp b/Telegram/SourceFiles/window/window_controller.cpp
+index b866e2f..ca3222f 100644
+--- a/Telegram/SourceFiles/window/window_controller.cpp
++++ b/Telegram/SourceFiles/window/window_controller.cpp
+@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "api/api_updates.h"
+ #include "core/application.h"
+ #include "core/click_handler_types.h"
++#include "core/sealgram_privacy.h"
+ #include "export/export_manager.h"
+ #include "ui/platform/ui_platform_window.h"
+ #include "platform/platform_window_title.h"
+@@ -586,6 +587,42 @@ Window::Adaptive &Controller::adaptive() const {
+ }
+ 
+ void Controller::openInMediaView(Media::View::OpenRequest &&request) {
++	if (request.story()) {
++		const auto story = not_null{ request.story() };
++		auto &privacy = Sealgram::PrivacySettings::Instance();
++		if (privacy.suggestGhostForStories()
++			&& !privacy.ghostOption(Sealgram::GhostOption::ReadStories)
++			&& !privacy.ghostModeEnabled()) {
++			const auto controller = request.controller();
++			const auto context = request.storiesContext();
++			show(Ui::MakeConfirmBox({
++				.text = tr::lng_sealgram_story_ghost_text(),
++				.confirmed = [=](Fn<void()> close) {
++					close();
++					Sealgram::PrivacySettings::Instance(
++						).beginTemporaryStoryGhost();
++					_openInMediaViewRequests.fire(
++						Media::View::OpenRequest(
++							controller,
++							story,
++							context));
++				},
++				.cancelled = [=](Fn<void()> close) {
++					close();
++					_openInMediaViewRequests.fire(
++						Media::View::OpenRequest(
++							controller,
++							story,
++							context));
++				},
++				.confirmText = tr::lng_sealgram_story_ghost_enable(),
++				.cancelText = tr::lng_cancel(),
++				.title = tr::lng_sealgram_story_ghost_title(),
++				.strictCancel = true,
++			}));
++			return;
++		}
++	}
+ 	_openInMediaViewRequests.fire(std::move(request));
+ }
+ 
+-- 
+2.54.0.windows.1
+

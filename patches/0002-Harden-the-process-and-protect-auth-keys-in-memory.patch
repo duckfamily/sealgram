@@ -1,0 +1,383 @@
+From 796dc3a96b95faf03a576ff309c820de7cc3de8e Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:32:34 +0300
+Subject: [PATCH 02/13] Harden the process and protect auth keys in memory
+
+Applies extension-point disable, image load restrictions, heap termination
+on corruption, Arbitrary Code Guard and Code Integrity Guard, as the very
+first statement in main() so the policies are in place before anything else
+runs. TDESKTOP_ACG=0 and TDESKTOP_CIG=0 are escape hatches for a machine
+where a driver disagrees.
+
+CIG needs no code signing certificate: it governs images loaded after the
+policy is applied, and our own executable is already mapped by then. All
+130 modules this build loads were checked and every one is Microsoft
+signed.
+
+The source comments record which policies were deliberately left alone -
+child process, strict handle check, a restrictive DACL - and why, so nobody
+adds them expecting an improvement.
+
+AuthKey locks its pages against paging and wipes them with OPENSSL_cleanse
+in the destructor, because the compiler may elide a write that is never
+read again.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .../SourceFiles/core/process_hardening.cpp    | 185 ++++++++++++++++++
+ Telegram/SourceFiles/core/process_hardening.h |  47 +++++
+ Telegram/SourceFiles/main.cpp                 |   6 +
+ .../SourceFiles/mtproto/mtproto_auth_key.cpp  |  39 ++++
+ .../SourceFiles/mtproto/mtproto_auth_key.h    |   5 +
+ 5 files changed, 282 insertions(+)
+ create mode 100644 Telegram/SourceFiles/core/process_hardening.cpp
+ create mode 100644 Telegram/SourceFiles/core/process_hardening.h
+
+diff --git a/Telegram/SourceFiles/core/process_hardening.cpp b/Telegram/SourceFiles/core/process_hardening.cpp
+new file mode 100644
+index 0000000..b495f6f
+--- /dev/null
++++ b/Telegram/SourceFiles/core/process_hardening.cpp
+@@ -0,0 +1,185 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "core/process_hardening.h"
++
++#include "logs.h"
++
++namespace Core {
++namespace {
++
++QString GlobalHardeningSummary;
++ProcessHardeningStatus GlobalHardeningStatus;
++
++} // namespace
++
++void RememberProcessHardening(const QString &summary) {
++	GlobalHardeningSummary = summary;
++}
++
++void LogProcessHardening() {
++	if (!GlobalHardeningSummary.isEmpty()) {
++		LOG(("Process hardening: %1").arg(GlobalHardeningSummary));
++	}
++}
++
++const ProcessHardeningStatus &GetProcessHardeningStatus() {
++	return GlobalHardeningStatus;
++}
++
++} // namespace Core
++
++#ifdef Q_OS_WIN
++
++#include <windows.h>
++
++#include <QtCore/QStringList>
++
++namespace Core {
++namespace {
++
++// Arbitrary Code Guard refuses any attempt to make memory executable at
++// runtime, which removes a whole family of injection techniques.
++//
++// The thing it can break is a legitimate component that generates machine code
++// as it runs. This build has no JIT of its own, but Qt's regular expressions
++// can use PCRE2's JIT and some display drivers generate code. PCRE2 falls back
++// to its interpreter when it cannot get executable memory, so the cost is a
++// little speed rather than a failure - verified by running with it before
++// turning it on here.
++//
++// Set TDESKTOP_ACG=0 to disable, in case some driver on some machine disagrees.
++[[nodiscard]] bool EnabledByEnvironment(const wchar_t *name) {
++	wchar_t value[8] = { 0 };
++	const auto length = GetEnvironmentVariableW(
++		name,
++		value,
++		DWORD(std::size(value)));
++	return !((length == 1) && (value[0] == L'0'));
++}
++
++[[nodiscard]] bool Apply(int policy, DWORD flags) {
++	auto value = flags;
++	return SetProcessMitigationPolicy(
++		PROCESS_MITIGATION_POLICY(policy),
++		&value,
++		sizeof(value)) != FALSE;
++}
++
++[[nodiscard]] MitigationState ApplyState(int policy, DWORD flags) {
++	if (Apply(policy, flags)) {
++		return MitigationState::Applied;
++	}
++	const auto error = GetLastError();
++	return (error == ERROR_INVALID_PARAMETER || error == ERROR_NOT_SUPPORTED)
++		? MitigationState::Unsupported
++		: MitigationState::Failed;
++}
++
++} // namespace
++
++QString ApplyProcessHardening() {
++	GlobalHardeningStatus = {};
++	auto applied = QStringList();
++	auto failed = QStringList();
++
++	const auto record = [&](const char *name, bool ok) {
++		(ok ? applied : failed).push_back(QString::fromUtf8(name));
++	};
++
++	// Blocks the legacy injection routes: AppInit_DLLs, global window hooks
++	// and IME extensions. Nothing modern relies on these.
++	record("extension-points", Apply(
++		ProcessExtensionPointDisablePolicy,
++		0x1)); // DisableExtensionPoints
++
++	// Refuse images from network shares, and images carrying a low integrity
++	// label - the kind a sandboxed process could drop for us to load.
++	// PreferSystem32Images closes the classic search-order hijack.
++	record("image-load", Apply(
++		ProcessImageLoadPolicy,
++		0x1 | 0x2 | 0x4));
++
++	// Turn heap corruption into an immediate stop rather than something an
++	// attacker can steer.
++	record("heap-terminate", HeapSetInformation(
++		nullptr,
++		HeapEnableTerminationOnCorruption,
++		nullptr,
++		0) != FALSE);
++
++	if (EnabledByEnvironment(L"TDESKTOP_ACG")) {
++		GlobalHardeningStatus.acg = ApplyState(
++			ProcessDynamicCodePolicy,
++			0x1); // ProhibitDynamicCode
++		record(
++			"dynamic-code(ACG)",
++			GlobalHardeningStatus.acg == MitigationState::Applied);
++	} else {
++		GlobalHardeningStatus.acg = MitigationState::DisabledByEnvironment;
++		applied.push_back("dynamic-code(ACG): disabled by environment");
++	}
++
++	// Code Integrity Guard: from here on, only images with a Microsoft-rooted
++	// signature can be mapped into this process. That closes the door on a
++	// stealer dropping a DLL beside us, and on anything else that wants to run
++	// its own code in here.
++	//
++	// This needs no certificate of our own - the policy governs images loaded
++	// after it is applied, and our executable is already mapped by then. Every
++	// DLL this build actually loads was checked and all of them are Microsoft
++	// signed: the third-party libraries are linked statically, and the one
++	// bundled DLL (d3dcompiler_47) ships signed by Microsoft.
++	//
++	// What can still be refused is somebody else's code that Windows would
++	// otherwise inject: a shell extension pulled in by a file dialog, an
++	// overlay, an antivirus hook. Those fail the load and are skipped; none of
++	// them is something this application needs to function.
++	//
++	// Set TDESKTOP_CIG=0 to disable, for the machine where that turns out wrong.
++	if (EnabledByEnvironment(L"TDESKTOP_CIG")) {
++		GlobalHardeningStatus.cig = ApplyState(
++			ProcessSignaturePolicy,
++			0x1); // MicrosoftSignedOnly
++		record(
++			"signed-images(CIG)",
++			GlobalHardeningStatus.cig == MitigationState::Applied);
++	} else {
++		GlobalHardeningStatus.cig = MitigationState::DisabledByEnvironment;
++		applied.push_back("signed-images(CIG): disabled by environment");
++	}
++
++	// Deliberately not enabled, with reasons:
++	//
++	// ProcessChildProcessPolicy - the updater and "open link in browser" both
++	//     need to start processes.
++	// ProcessStrictHandleCheckPolicy - turns any sloppy handle use anywhere in
++	//     Qt, ANGLE or a display driver into an instant crash.
++	// A restrictive DACL on our own process - would also lock out the crash
++	//     reporter, which has to read this process to produce a dump.
++
++	auto result = QString("applied: %1").arg(applied.join(", "));
++	if (!failed.isEmpty()) {
++		result += QString("; failed: %1").arg(failed.join(", "));
++	}
++	return result;
++}
++
++} // namespace Core
++
++#else // Q_OS_WIN
++
++namespace Core {
++
++QString ApplyProcessHardening() {
++	GlobalHardeningStatus = {};
++	return QString("not implemented on this platform");
++}
++
++} // namespace Core
++
++#endif // Q_OS_WIN
+diff --git a/Telegram/SourceFiles/core/process_hardening.h b/Telegram/SourceFiles/core/process_hardening.h
+new file mode 100644
+index 0000000..41313d2
+--- /dev/null
++++ b/Telegram/SourceFiles/core/process_hardening.h
+@@ -0,0 +1,47 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include <QtCore/QString>
++
++namespace Core {
++
++enum class MitigationState {
++	Applied,
++	DisabledByEnvironment,
++	Failed,
++	Unsupported,
++};
++
++struct ProcessHardeningStatus {
++	MitigationState acg = MitigationState::Unsupported;
++	MitigationState cig = MitigationState::Unsupported;
++};
++
++// Applies process-wide mitigations that make it harder for another program
++// running as the same user to get code into this process.
++//
++// Must be called as early as possible - before any plugin, hook or injected
++// library has had a chance to load. None of this stops an attacker who is
++// already administrator or in the kernel; the goal is commodity stealers,
++// which inject with stock APIs.
++//
++// Safe to call once, at startup. Returns a human readable summary for the log.
++[[nodiscard]] QString ApplyProcessHardening();
++
++// Hardening runs before logging exists, so the summary is kept until it can be
++// written out. Without this the one thing worth knowing - which mitigations
++// actually took effect on this machine - would be lost.
++void RememberProcessHardening(const QString &summary);
++
++// Writes the remembered summary to the log. Call once logging is up.
++void LogProcessHardening();
++
++[[nodiscard]] const ProcessHardeningStatus &GetProcessHardeningStatus();
++
++} // namespace Core
+diff --git a/Telegram/SourceFiles/main.cpp b/Telegram/SourceFiles/main.cpp
+index d3d938c..adfc3e6 100644
+--- a/Telegram/SourceFiles/main.cpp
++++ b/Telegram/SourceFiles/main.cpp
+@@ -6,8 +6,14 @@ For license and copyright information please follow this link:
+ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ */
+ #include "core/launcher.h"
++#include "core/process_hardening.h"
+ 
+ int main(int argc, char *argv[]) {
++	// Before anything else: the point of these mitigations is to be in force
++	// prior to any library, plugin or injected DLL getting a chance to run.
++	// The summary is logged later, once logging exists.
++	Core::RememberProcessHardening(Core::ApplyProcessHardening());
++
+ 	const auto launcher = Core::Launcher::Create(argc, argv);
+ 	return launcher ? launcher->exec() : 1;
+ }
+diff --git a/Telegram/SourceFiles/mtproto/mtproto_auth_key.cpp b/Telegram/SourceFiles/mtproto/mtproto_auth_key.cpp
+index c84d19a..0f23431 100644
+--- a/Telegram/SourceFiles/mtproto/mtproto_auth_key.cpp
++++ b/Telegram/SourceFiles/mtproto/mtproto_auth_key.cpp
+@@ -11,12 +11,45 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ #include <QtCore/QDataStream>
+ 
++#ifdef Q_OS_WIN
++#include <windows.h>
++#endif // Q_OS_WIN
++
+ namespace MTP {
++namespace {
++
++// Keeps the pages holding the key out of the page file and the hibernation
++// file. Those are the copies that outlive the process and that nobody thinks
++// about; the running process itself is protected by other means.
++//
++// Best effort on purpose: the per-process working set quota can refuse the
++// lock, and a key that might be paged is still far better than no client.
++void TryLockPages(void *data, size_t size) {
++#ifdef Q_OS_WIN
++	VirtualLock(data, size);
++#endif // Q_OS_WIN
++}
++
++void UnlockPages(void *data, size_t size) {
++#ifdef Q_OS_WIN
++	VirtualUnlock(data, size);
++#endif // Q_OS_WIN
++}
++
++// OPENSSL_cleanse is used rather than a plain loop because the compiler is
++// entitled to delete a write to memory that is never read again - which is
++// exactly what wiping a buffer before freeing it looks like.
++void Wipe(void *data, size_t size) {
++	OPENSSL_cleanse(data, size);
++}
++
++} // namespace
+ 
+ AuthKey::AuthKey(Type type, DcId dcId, const Data &data)
+ : _type(type)
+ , _dcId(dcId)
+ , _key(data) {
++	TryLockPages(_key.data(), _key.size());
+ 	countKeyId();
+ 	if (type == Type::Generated || type == Type::Temporary) {
+ 		_creationTime = crl::now();
+@@ -24,9 +57,15 @@ AuthKey::AuthKey(Type type, DcId dcId, const Data &data)
+ }
+ 
+ AuthKey::AuthKey(const Data &data) : _type(Type::Local), _key(data) {
++	TryLockPages(_key.data(), _key.size());
+ 	countKeyId();
+ }
+ 
++AuthKey::~AuthKey() {
++	Wipe(_key.data(), _key.size());
++	UnlockPages(_key.data(), _key.size());
++}
++
+ AuthKey::Type AuthKey::type() const {
+ 	return _type;
+ }
+diff --git a/Telegram/SourceFiles/mtproto/mtproto_auth_key.h b/Telegram/SourceFiles/mtproto/mtproto_auth_key.h
+index 31d0e3d..13316ff 100644
+--- a/Telegram/SourceFiles/mtproto/mtproto_auth_key.h
++++ b/Telegram/SourceFiles/mtproto/mtproto_auth_key.h
+@@ -28,6 +28,11 @@ public:
+ 	AuthKey(Type type, DcId dcId, const Data &data);
+ 	explicit AuthKey(const Data &data);
+ 
++	// Wipes the key material and releases the page lock taken in the
++	// constructor. Without this the 256 bytes that own the account simply stay
++	// in freed heap until something happens to overwrite them.
++	~AuthKey();
++
+ 	AuthKey(const AuthKey &other) = delete;
+ 	AuthKey &operator=(const AuthKey &other) = delete;
+ 
+-- 
+2.54.0.windows.1
+

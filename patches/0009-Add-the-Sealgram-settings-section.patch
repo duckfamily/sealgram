@@ -1,0 +1,1420 @@
+From f73ca25b747f93d760368c58a70abdf89024a54c Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:33:58 +0300
+Subject: [PATCH 09/13] Add the Sealgram settings section
+
+Security, Privacy, Network, Appearance and Updates, plus a connection
+dashboard under Network showing live state: the current proxy and its
+response time, whether media is flowing, every known proxy sorted by
+measured ping with its badges, and a history of automatic switches with the
+reason for each.
+
+The dashboard answers the question the log could answer and the interface
+could not: why did it switch, and why is it slow. Rows are clickable to
+switch by hand; the measure button deliberately does not switch.
+
+Security is informational only. There are no controls there that weaken the
+hardening or reset the TPM key, because a control that quietly destroys
+every sealed profile is not a setting.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Telegram/Resources/langs/lang.strings         |   97 +-
+ .../settings/sections/settings_main.cpp       |   14 +
+ .../settings/sections/settings_sealgram.cpp   | 1174 +++++++++++++++++
+ .../settings/sections/settings_sealgram.h     |   22 +
+ Telegram/SourceFiles/settings/settings.style  |    6 +
+ 5 files changed, 1310 insertions(+), 3 deletions(-)
+ create mode 100644 Telegram/SourceFiles/settings/sections/settings_sealgram.cpp
+ create mode 100644 Telegram/SourceFiles/settings/sections/settings_sealgram.h
+
+diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
+index ae6bcf7..606cc07 100644
+--- a/Telegram/Resources/langs/lang.strings
++++ b/Telegram/Resources/langs/lang.strings
+@@ -28,10 +28,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ "lng_disable_notifications_from_tray" = "Disable notifications";
+ "lng_enable_notifications_from_tray" = "Enable notifications";
+-"lng_open_from_tray" = "Open Telegram";
++"lng_open_from_tray" = "Open Sealgram";
+ "lng_minimize_to_tray" = "Minimize to Tray";
+-"lng_quit_from_tray" = "Quit Telegram";
+-"lng_tray_icon_text" = "Telegram is still running here,\nyou can change this in Settings.\nIf it disappears from the tray,\nyou can drag it back from the hidden icons.";
++"lng_quit_from_tray" = "Quit Sealgram";
++"lng_tray_icon_text" = "Sealgram is still running here,\nyou can change this in Settings.\nIf it disappears from the tray,\nyou can drag it back from the hidden icons.";
+ 
+ // For lng_month_year or plain month name.
+ "lng_month1" = "January";
+@@ -6080,6 +6080,97 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ "lng_theme_preview_users#other" = "{count} people are using this theme";
+ 
+ "lng_new_version_wrap" = "Telegram Desktop was updated to version {version}\n\n{changes}\n\nFull version history is available here:\n{link}";
++"lng_sealgram_settings" = "Sealgram Settings";
++"lng_sealgram_desktop_version" = "Sealgram Desktop {version}";
++"lng_sealgram_description" = "A secure Telegram Desktop fork.";
++"lng_sealgram_security" = "Security";
++"lng_sealgram_network" = "Network";
++"lng_sealgram_updates" = "Updates";
++"lng_sealgram_security_about" = "Current protection status";
++"lng_sealgram_tpm" = "TPM sealing";
++"lng_sealgram_acg" = "Arbitrary Code Guard (ACG)";
++"lng_sealgram_cig" = "Code Integrity Guard (CIG)";
++"lng_sealgram_status_available" = "Available";
++"lng_sealgram_status_unavailable" = "Unavailable";
++"lng_sealgram_status_applied" = "Applied";
++"lng_sealgram_status_disabled_environment" = "Disabled by environment";
++"lng_sealgram_status_failed" = "Failed";
++"lng_sealgram_status_unsupported" = "Unsupported";
++"lng_sealgram_proxy_feed" = "Automatically receive Sealgram proxies";
++"lng_sealgram_proxies_rotation" = "Proxies and rotation";
++"lng_sealgram_connection" = "Connection status";
++"lng_sealgram_connection_state" = "Connection";
++"lng_sealgram_connection_connected" = "Connected";
++"lng_sealgram_connection_connecting" = "Connecting";
++"lng_sealgram_connection_waiting" = "Waiting for network";
++"lng_sealgram_connection_direct" = "Direct, no proxy";
++"lng_sealgram_connection_proxy" = "Current proxy";
++"lng_sealgram_connection_ping" = "Response time";
++"lng_sealgram_connection_ping_value" = "{ping} ms";
++"lng_sealgram_connection_media" = "Media downloads";
++"lng_sealgram_connection_media_ok" = "Normal";
++"lng_sealgram_connection_media_stalls#one" = "{count} stall in the last 25 s";
++"lng_sealgram_connection_media_stalls#other" = "{count} stalls in the last 25 s";
++"lng_sealgram_connection_measure" = "Measure all proxies";
++"lng_sealgram_connection_measuring" = "Measuring...";
++"lng_sealgram_connection_list" = "Proxies";
++"lng_sealgram_connection_none" = "No proxies added yet";
++"lng_sealgram_connection_checking" = "checking";
++"lng_sealgram_connection_silent" = "no answer";
++"lng_sealgram_connection_current" = "in use";
++"lng_sealgram_connection_media_failed" = "no media";
++"lng_sealgram_connection_history" = "Recent switches";
++"lng_sealgram_connection_history_empty" = "Nothing has switched yet";
++"lng_sealgram_connection_reason_manual" = "chosen manually";
++"lng_sealgram_connection_reason_noconnection" = "nothing was connecting";
++"lng_sealgram_connection_reason_media" = "media was not loading";
++"lng_sealgram_connection_reason_bootstrap" = "first connection";
++"lng_sealgram_connection_about" = "Sealgram measures the proxies it knows and moves to the fastest one that answers. It also switches when messages arrive but media does not, which an ordinary connection check cannot see.";
++"lng_sealgram_update_automatic" = "Automatically check for Sealgram updates";
++"lng_sealgram_current_version" = "Current version";
++"lng_sealgram_check_updates" = "Check for updates";
++"lng_sealgram_update_title" = "Sealgram update";
++"lng_sealgram_update_text" = "Sealgram {version} is available.\n\n{changes}";
++"lng_sealgram_update_download" = "Download";
++"lng_sealgram_update_current_title" = "No updates";
++"lng_sealgram_update_current_text" = "You are using the latest version of Sealgram.";
++"lng_sealgram_update_error_title" = "Update check failed";
++"lng_sealgram_update_error_text" = "Sealgram could not securely check for updates. Please try again later.";
++"lng_sealgram_privacy" = "Privacy";
++"lng_sealgram_appearance" = "Appearance";
++"lng_sealgram_custom_wallpaper" = "Custom wallpaper";
++"lng_sealgram_custom_wallpaper_about" = "Images, GIFs and videos are shown continuously behind the chat and chat list.";
++"lng_sealgram_choose_wallpaper" = "Choose image, GIF or video";
++"lng_sealgram_clear_wallpaper" = "Remove custom wallpaper";
++"lng_sealgram_wallpaper_none" = "Not selected";
++"lng_sealgram_ghost_mode" = "Ghost mode";
++"lng_sealgram_dont_read_messages" = "Do not read messages";
++"lng_sealgram_dont_read_stories" = "Do not read stories";
++"lng_sealgram_dont_send_online" = "Do not send online status";
++"lng_sealgram_dont_send_progress" = "Do not send typing or upload progress";
++"lng_sealgram_automatic_offline" = "Automatic offline";
++"lng_sealgram_read_after_action" = "Read on actions";
++"lng_sealgram_read_after_action_about" = "Marks the chat as read after you send a message, react, vote, or use a bot action.";
++"lng_sealgram_use_delay" = "Use delayed sending";
++"lng_sealgram_use_delay_about" = "Sends messages through Telegram scheduling after a short delay while full ghost mode is active.";
++"lng_sealgram_send_silent" = "Send without sound";
++"lng_sealgram_silent_never" = "Never";
++"lng_sealgram_silent_ghost" = "In ghost mode";
++"lng_sealgram_silent_always" = "Always";
++"lng_sealgram_suggest_story_ghost" = "Suggest ghost mode for stories";
++"lng_sealgram_story_ghost_title" = "Enable ghost mode?";
++"lng_sealgram_story_ghost_text" = "Enable ghost mode temporarily before opening this story?";
++"lng_sealgram_story_ghost_enable" = "Enable";
++"lng_sealgram_spy_mode" = "Spy mode";
++"lng_sealgram_save_deleted" = "Save deleted messages";
++"lng_sealgram_save_edits" = "Save edit history";
++"lng_sealgram_save_bots" = "Save in chats with bots";
++"lng_sealgram_other" = "Other";
++"lng_sealgram_local_premium" = "Local Telegram Premium";
++"lng_sealgram_disable_ads" = "Disable ads";
++"lng_sealgram_clear_archive" = "Clear the entire archive";
++"lng_sealgram_clear_archive_title" = "Clear archive?";
++"lng_sealgram_clear_archive_text" = "This permanently deletes all saved deleted messages and edit history from every account.";
+ "lng_new_version_minor" = "— Bug fixes and other minor improvements";
+ 
+ "lng_menu_insert_unicode" = "Insert Unicode control character";
+diff --git a/Telegram/SourceFiles/settings/sections/settings_main.cpp b/Telegram/SourceFiles/settings/sections/settings_main.cpp
+index ea0e360..2f815e5 100644
+--- a/Telegram/SourceFiles/settings/sections/settings_main.cpp
++++ b/Telegram/SourceFiles/settings/sections/settings_main.cpp
+@@ -58,6 +58,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ #include "settings/settings_power_saving.h"
+ #include "settings/sections/settings_premium.h"
+ #include "settings/sections/settings_privacy_security.h"
++#include "settings/sections/settings_sealgram.h"
+ #include "settings/settings_scale_preview.h"
+ #include "storage/localstorage.h"
+ #include "ui/basic_click_handlers.h"
+@@ -468,6 +469,15 @@ void BuildSectionButtons(SectionBuilder &builder) {
+ 	});
+ }
+ 
++void BuildSealgramButton(SectionBuilder &builder) {
++	builder.addSectionButton({
++		.title = tr::lng_sealgram_settings(),
++		.targetSection = SealgramId(),
++		.icon = { &st::menuIconStar },
++		.keywords = { u"sealgram"_q, u"fork"_q, u"security"_q, u"proxy"_q },
++	});
++}
++
+ void BuildInterfaceScale(SectionBuilder &builder) {
+ 	if (!HasInterfaceScale()) {
+ 		return;
+@@ -714,6 +724,9 @@ void Main::setupContent() {
+ 		});
+ 		builder.addDivider();
+ 		builder.addSkip();
++		BuildSealgramButton(builder);
++		builder.addDivider();
++		builder.addSkip();
+ 		BuildValidationSuggestions(builder);
+ 		BuildSectionButtons(builder);
+ 		builder.addSkip();
+@@ -787,6 +800,7 @@ const auto kMeta = BuildHelper({
+ 		};
+ 	});
+ 
++	BuildSealgramButton(builder);
+ 	BuildValidationSuggestions(builder);
+ 	BuildSectionButtons(builder);
+ 
+diff --git a/Telegram/SourceFiles/settings/sections/settings_sealgram.cpp b/Telegram/SourceFiles/settings/sections/settings_sealgram.cpp
+new file mode 100644
+index 0000000..5a0c37f
+--- /dev/null
++++ b/Telegram/SourceFiles/settings/sections/settings_sealgram.cpp
+@@ -0,0 +1,1174 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "settings/sections/settings_sealgram.h"
++
++#include "boxes/connection_box.h"
++#include "core/application.h"
++#include "core/file_utilities.h"
++#include "core/process_hardening.h"
++#include "core/sealgram_privacy.h"
++#include "core/sealgram_wallpaper.h"
++#include "core/version.h"
++#include "api/api_updates.h"
++#include "lang/lang_keys.h"
++#include "main/main_session.h"
++#include "main/main_account.h"
++#include "main/main_domain.h"
++#include "settings/sections/settings_main.h"
++#include "settings/settings_builder.h"
++#include "settings/settings_common_session.h"
++#include "storage/details/storage_tpm_seal.h"
++#include "ui/painter.h"
++#include "ui/widgets/buttons.h"
++#include "ui/widgets/labels.h"
++#include "ui/boxes/single_choice_box.h"
++#include "ui/boxes/confirm_box.h"
++#include "ui/wrap/vertical_layout.h"
++#include "window/main_window.h"
++#include "window/window_session_controller.h"
++
++#include "base/timer_rpl.h"
++#include "base/unixtime.h"
++#include "core/proxy_rotation_manager.h"
++#include "mtproto/facade.h"
++#include "mtproto/mtp_instance.h"
++#include "settings/settings_common.h"
++#include "styles/style_boxes.h"
++#include "styles/style_menu_icons.h"
++#include "styles/style_settings.h"
++
++#include <QtCore/QFileInfo>
++
++namespace Settings {
++namespace {
++
++using namespace Builder;
++
++class SealgramCover final : public Ui::RpWidget {
++public:
++	explicit SealgramCover(QWidget *parent);
++
++protected:
++	void paintEvent(QPaintEvent *e) override;
++
++private:
++	not_null<Ui::FlatLabel*> _title;
++	not_null<Ui::FlatLabel*> _description;
++
++};
++
++class SealgramSection final : public Section<SealgramSection> {
++public:
++	SealgramSection(
++		QWidget *parent,
++		not_null<Window::SessionController*> controller);
++
++	[[nodiscard]] rpl::producer<QString> title() override;
++
++private:
++	void setupContent();
++
++};
++
++class SealgramSecurity final : public Section<SealgramSecurity> {
++public:
++	SealgramSecurity(
++		QWidget *parent,
++		not_null<Window::SessionController*> controller);
++
++	[[nodiscard]] rpl::producer<QString> title() override;
++
++private:
++	void setupContent();
++
++};
++
++class SealgramNetwork final : public Section<SealgramNetwork> {
++public:
++	SealgramNetwork(
++		QWidget *parent,
++		not_null<Window::SessionController*> controller);
++
++	[[nodiscard]] rpl::producer<QString> title() override;
++
++private:
++	void setupContent();
++
++};
++
++class SealgramConnection final : public Section<SealgramConnection> {
++public:
++	SealgramConnection(
++		QWidget *parent,
++		not_null<Window::SessionController*> controller);
++
++	[[nodiscard]] rpl::producer<QString> title() override;
++
++private:
++	void setupContent();
++
++};
++
++class SealgramPrivacy final : public Section<SealgramPrivacy> {
++public:
++	SealgramPrivacy(
++		QWidget *parent,
++		not_null<Window::SessionController*> controller);
++
++	[[nodiscard]] rpl::producer<QString> title() override;
++
++private:
++	void setupContent();
++
++};
++
++class SealgramAppearance final : public Section<SealgramAppearance> {
++public:
++	SealgramAppearance(
++		QWidget *parent,
++		not_null<Window::SessionController*> controller);
++
++	[[nodiscard]] rpl::producer<QString> title() override;
++
++private:
++	void setupContent();
++
++};
++
++class SealgramUpdates final : public Section<SealgramUpdates> {
++public:
++	SealgramUpdates(
++		QWidget *parent,
++		not_null<Window::SessionController*> controller);
++
++	[[nodiscard]] rpl::producer<QString> title() override;
++
++private:
++	void setupContent();
++
++};
++
++SealgramCover::SealgramCover(QWidget *parent)
++: RpWidget(parent)
++, _title(Ui::CreateChild<Ui::FlatLabel>(
++	this,
++	tr::lng_sealgram_desktop_version(
++		lt_version,
++		rpl::single(QString::fromLatin1(AppVersionStr))),
++	st::settingsCoverName))
++, _description(Ui::CreateChild<Ui::FlatLabel>(
++	this,
++	tr::lng_sealgram_description(),
++	st::settingsCoverStatus)) {
++	resize(0, st::sealgramCoverHeight);
++	_title->setAttribute(Qt::WA_TransparentForMouseEvents);
++	_description->setAttribute(Qt::WA_TransparentForMouseEvents);
++
++	rpl::combine(
++		widthValue(),
++		_title->widthValue(),
++		_description->widthValue()
++	) | rpl::on_next([=](int width, int titleWidth, int descriptionWidth) {
++		_title->moveToLeft(
++			(width - titleWidth) / 2,
++			st::sealgramCoverTitleTop);
++		_description->moveToLeft(
++			(width - descriptionWidth) / 2,
++			st::sealgramCoverDescriptionTop);
++	}, lifetime());
++}
++
++void SealgramCover::paintEvent(QPaintEvent *e) {
++	auto p = Painter(this);
++	p.setClipRect(e->rect());
++	p.setRenderHint(QPainter::SmoothPixmapTransform);
++	const auto left = (width() - st::sealgramCoverLogoSize) / 2;
++	p.drawImage(
++		QRect(
++			left,
++			st::sealgramCoverLogoTop,
++			st::sealgramCoverLogoSize,
++			st::sealgramCoverLogoSize),
++		Window::LogoNoMargin());
++}
++
++[[nodiscard]] rpl::producer<QString> MitigationStatusText(
++		Core::MitigationState state) {
++	switch (state) {
++	case Core::MitigationState::Applied:
++		return tr::lng_sealgram_status_applied();
++	case Core::MitigationState::DisabledByEnvironment:
++		return tr::lng_sealgram_status_disabled_environment();
++	case Core::MitigationState::Failed:
++		return tr::lng_sealgram_status_failed();
++	case Core::MitigationState::Unsupported:
++		return tr::lng_sealgram_status_unsupported();
++	}
++	Unexpected("MitigationState in MitigationStatusText.");
++}
++
++void BuildSealgram(SectionBuilder &builder) {
++	builder.add([](const BuildContext &context) {
++		const auto widget = std::get_if<WidgetContext>(&context);
++		return widget
++			? SectionBuilder::WidgetToAdd{
++				.widget = object_ptr<SealgramCover>(widget->container),
++				.align = style::al_top,
++			}
++			: SectionBuilder::WidgetToAdd();
++	});
++	builder.addDivider();
++	builder.addSkip();
++	builder.addSectionButton({
++		.title = tr::lng_sealgram_security(),
++		.targetSection = SealgramSecurity::Id(),
++		.icon = { &st::menuIconLock },
++		.keywords = { u"security"_q, u"tpm"_q, u"acg"_q, u"cig"_q },
++	});
++	builder.addSectionButton({
++		.title = tr::lng_sealgram_privacy(),
++		.targetSection = SealgramPrivacy::Id(),
++		.icon = { &st::menuIconPermissions },
++		.keywords = { u"privacy"_q, u"ghost"_q, u"spy"_q, u"приватность"_q, u"призрак"_q },
++	});
++	builder.addSectionButton({
++		.title = tr::lng_sealgram_network(),
++		.targetSection = SealgramNetwork::Id(),
++		.icon = { &st::menuIconNetwork },
++		.keywords = { u"network"_q, u"proxy"_q, u"rotation"_q },
++	});
++	builder.addSectionButton({
++		.title = tr::lng_sealgram_appearance(),
++		.targetSection = SealgramAppearance::Id(),
++		.icon = { &st::menuIconPhoto },
++		.keywords = {
++			u"appearance"_q,
++			u"wallpaper"_q,
++			u"background"_q,
++			u"gif"_q,
++			u"mp4"_q,
++		},
++	});
++	builder.addSectionButton({
++		.title = tr::lng_sealgram_updates(),
++		.targetSection = SealgramUpdates::Id(),
++		.icon = { &st::menuIconDownload },
++		.keywords = { u"update"_q, u"version"_q, u"download"_q },
++	});
++	builder.addSkip();
++}
++
++void BuildSealgramPrivacy(SectionBuilder &builder) {
++	const auto privacy = &Sealgram::PrivacySettings::Instance();
++	const auto session = builder.session();
++	const auto controller = builder.controller();
++	const auto addToggle = [&](QString id,
++			rpl::producer<QString> title,
++			rpl::producer<bool> value,
++			Fn<bool()> current,
++			Fn<void(bool)> setter,
++			QStringList keywords = {}) {
++		const auto toggle = builder.addButton({
++			.id = std::move(id),
++			.title = std::move(title),
++			.st = &st::settingsButtonNoIcon,
++			.toggled = std::move(value),
++			.keywords = std::move(keywords),
++		});
++		if (toggle) {
++			toggle->toggledValue(
++			) | rpl::filter([=](bool enabled) {
++				return enabled != current();
++			}) | rpl::on_next([=](bool enabled) {
++				setter(enabled);
++			}, toggle->lifetime());
++		}
++		return toggle;
++	};
++	const auto ghostValue = [&](Sealgram::GhostOption option) {
++		return privacy->ghostOptionsValue(
++		) | rpl::map([=](Sealgram::GhostOptions options) {
++			return (options & option) != Sealgram::GhostOptions();
++		});
++	};
++	const auto setGhost = [=](Sealgram::GhostOption option, bool enabled) {
++		privacy->setGhostOption(option, enabled);
++		if (option == Sealgram::GhostOption::OnlineStatus
++			|| option == Sealgram::GhostOption::AutomaticOffline) {
++			session->updates().updateOnline(0);
++		}
++	};
++
++	builder.addSkip();
++	builder.addSubsectionTitle({
++		.id = u"sealgram/privacy/ghost"_q,
++		.title = tr::lng_sealgram_ghost_mode(),
++		.keywords = { u"ghost"_q, u"invisible"_q, u"призрак"_q },
++	});
++	addToggle(
++		u"sealgram/privacy/ghost-master"_q,
++		privacy->ghostOptionsValue(
++		) | rpl::map([=](Sealgram::GhostOptions) {
++			return tr::lng_sealgram_ghost_mode(tr::now)
++				+ u" %1/5"_q.arg(privacy->ghostOptionsCount());
++		}),
++		privacy->ghostOptionsValue(
++		) | rpl::map([=](Sealgram::GhostOptions) {
++			return privacy->ghostModeEnabled();
++		}),
++		[=] { return privacy->ghostModeEnabled(); },
++		[=](bool enabled) {
++			privacy->setGhostModeEnabled(enabled);
++			session->updates().updateOnline(0);
++		});
++	addToggle(
++		u"sealgram/privacy/read-messages"_q,
++		tr::lng_sealgram_dont_read_messages(),
++		ghostValue(Sealgram::GhostOption::ReadMessages),
++		[=] {
++			return privacy->ghostOption(
++				Sealgram::GhostOption::ReadMessages);
++		},
++		[=](bool enabled) {
++			setGhost(Sealgram::GhostOption::ReadMessages, enabled);
++		});
++	addToggle(
++		u"sealgram/privacy/read-stories"_q,
++		tr::lng_sealgram_dont_read_stories(),
++		ghostValue(Sealgram::GhostOption::ReadStories),
++		[=] {
++			return privacy->ghostOption(
++				Sealgram::GhostOption::ReadStories);
++		},
++		[=](bool enabled) {
++			setGhost(Sealgram::GhostOption::ReadStories, enabled);
++		});
++	addToggle(
++		u"sealgram/privacy/online"_q,
++		tr::lng_sealgram_dont_send_online(),
++		ghostValue(Sealgram::GhostOption::OnlineStatus),
++		[=] {
++			return privacy->ghostOption(
++				Sealgram::GhostOption::OnlineStatus);
++		},
++		[=](bool enabled) {
++			setGhost(Sealgram::GhostOption::OnlineStatus, enabled);
++		});
++	addToggle(
++		u"sealgram/privacy/progress"_q,
++		tr::lng_sealgram_dont_send_progress(),
++		ghostValue(Sealgram::GhostOption::SendProgress),
++		[=] {
++			return privacy->ghostOption(
++				Sealgram::GhostOption::SendProgress);
++		},
++		[=](bool enabled) {
++			setGhost(Sealgram::GhostOption::SendProgress, enabled);
++		});
++	addToggle(
++		u"sealgram/privacy/offline"_q,
++		tr::lng_sealgram_automatic_offline(),
++		ghostValue(Sealgram::GhostOption::AutomaticOffline),
++		[=] {
++			return privacy->ghostOption(
++				Sealgram::GhostOption::AutomaticOffline);
++		},
++		[=](bool enabled) {
++			setGhost(Sealgram::GhostOption::AutomaticOffline, enabled);
++		});
++
++	addToggle(
++		u"sealgram/privacy/read-after-action"_q,
++		tr::lng_sealgram_read_after_action(),
++		privacy->readAfterActionValue(),
++		[=] { return privacy->readAfterAction(); },
++		[=](bool enabled) { privacy->setReadAfterAction(enabled); });
++	builder.addDividerText(tr::lng_sealgram_read_after_action_about());
++	addToggle(
++		u"sealgram/privacy/delay"_q,
++		tr::lng_sealgram_use_delay(),
++		privacy->useScheduledMessagesValue(),
++		[=] { return privacy->useScheduledMessages(); },
++		[=](bool enabled) {
++			privacy->setUseScheduledMessages(enabled);
++		});
++	builder.addDividerText(tr::lng_sealgram_use_delay_about());
++
++	const auto silentOptions = std::vector<QString>{
++		tr::lng_sealgram_silent_never(tr::now),
++		tr::lng_sealgram_silent_ghost(tr::now),
++		tr::lng_sealgram_silent_always(tr::now),
++	};
++	const auto silent = builder.addButton({
++		.id = u"sealgram/privacy/silent"_q,
++		.title = tr::lng_sealgram_send_silent(),
++		.st = &st::settingsButtonNoIcon,
++		.label = privacy->sendWithoutSoundValue(
++		) | rpl::map([=](Sealgram::SendWithoutSoundMode mode) {
++			return silentOptions[int(mode)];
++		}),
++		.onClick = [=] {
++			builder.controller()->show(Box([=](not_null<Ui::GenericBox*> box) {
++				SingleChoiceBox(box, {
++					.title = tr::lng_sealgram_send_silent(),
++					.options = silentOptions,
++					.initialSelection = int(privacy->sendWithoutSound()),
++					.callback = [=](int index) {
++						privacy->setSendWithoutSound(
++							Sealgram::SendWithoutSoundMode(index));
++					},
++				});
++			}));
++		},
++		.keywords = { u"silent"_q, u"sound"_q, u"тихо"_q },
++	});
++	(void)silent;
++	addToggle(
++		u"sealgram/privacy/story-suggestion"_q,
++		tr::lng_sealgram_suggest_story_ghost(),
++		privacy->suggestGhostForStoriesValue(),
++		[=] { return privacy->suggestGhostForStories(); },
++		[=](bool enabled) {
++			privacy->setSuggestGhostForStories(enabled);
++		});
++
++	builder.addDivider();
++	builder.addSkip();
++	builder.addSubsectionTitle({
++		.id = u"sealgram/privacy/spy"_q,
++		.title = tr::lng_sealgram_spy_mode(),
++		.keywords = { u"spy"_q, u"deleted"_q, u"edits"_q, u"удалённые"_q },
++	});
++	addToggle(
++		u"sealgram/privacy/save-deleted"_q,
++		tr::lng_sealgram_save_deleted(),
++		privacy->saveDeletedMessagesValue(),
++		[=] { return privacy->saveDeletedMessages(); },
++		[=](bool enabled) {
++			privacy->setSaveDeletedMessages(enabled);
++		});
++	addToggle(
++		u"sealgram/privacy/save-edits"_q,
++		tr::lng_sealgram_save_edits(),
++		privacy->saveEditHistoryValue(),
++		[=] { return privacy->saveEditHistory(); },
++		[=](bool enabled) { privacy->setSaveEditHistory(enabled); });
++	addToggle(
++		u"sealgram/privacy/save-bots"_q,
++		tr::lng_sealgram_save_bots(),
++		privacy->saveBotChatsValue(),
++		[=] { return privacy->saveBotChats(); },
++		[=](bool enabled) { privacy->setSaveBotChats(enabled); });
++	builder.addButton({
++		.id = u"sealgram/privacy/archive/clear"_q,
++		.title = tr::lng_sealgram_clear_archive(),
++		.icon = { &st::menuIconDelete },
++		.onClick = [=] {
++			controller->show(Ui::MakeConfirmBox({
++				.text = tr::lng_sealgram_clear_archive_text(),
++				.confirmed = [] {
++					for (const auto &entry : Core::App().domain().accounts()) {
++						if (entry.account->sessionExists()) {
++							Sealgram::ClearPrivacyArchive(
++								&entry.account->session());
++						}
++					}
++				},
++				.confirmText = tr::lng_box_delete(),
++				.title = tr::lng_sealgram_clear_archive_title(),
++			}));
++		},
++		.keywords = { u"archive"_q, u"clear"_q, u"delete"_q },
++	});
++
++	builder.addDivider();
++	builder.addSkip();
++	builder.addSubsectionTitle({
++		.id = u"sealgram/privacy/other"_q,
++		.title = tr::lng_sealgram_other(),
++	});
++	addToggle(
++		u"sealgram/privacy/local-premium"_q,
++		tr::lng_sealgram_local_premium(),
++		privacy->localPremiumValue(),
++		[=] { return privacy->localPremium(); },
++		[=](bool enabled) { privacy->setLocalPremium(enabled); });
++	addToggle(
++		u"sealgram/privacy/disable-ads"_q,
++		tr::lng_sealgram_disable_ads(),
++		privacy->disableAdsValue(),
++		[=] { return privacy->disableAds(); },
++		[=](bool enabled) { privacy->setDisableAds(enabled); });
++	builder.addSkip();
++}
++
++void BuildSealgramAppearance(SectionBuilder &builder) {
++	const auto wallpaper = &Sealgram::WindowWallpaper::Instance();
++	const auto parent = Core::App().getFileDialogParent();
++
++	builder.addSkip();
++	builder.addSubsectionTitle({
++		.id = u"sealgram/appearance/wallpaper"_q,
++		.title = tr::lng_sealgram_custom_wallpaper(),
++		.keywords = {
++			u"wallpaper"_q,
++			u"background"_q,
++			u"gif"_q,
++			u"mp4"_q,
++		},
++	});
++	builder.addButton({
++		.id = u"sealgram/appearance/wallpaper/choose"_q,
++		.title = tr::lng_sealgram_choose_wallpaper(),
++		.icon = { &st::menuIconPhoto },
++		.label = wallpaper->pathValue(
++		) | rpl::map([](const QString &path) {
++			return path.isEmpty()
++				? tr::lng_sealgram_wallpaper_none(tr::now)
++				: QFileInfo(path).fileName();
++		}),
++		.onClick = [=] {
++			auto filters = QStringList{
++				u"Wallpapers (*.png *.jpg *.jpeg *.webp *.bmp *.gif "
++					"*.mp4 *.m4v *.mov *.webm)"_q,
++				FileDialog::AllFilesFilter(),
++			};
++			FileDialog::GetOpenPath(
++				parent,
++				tr::lng_sealgram_choose_wallpaper(tr::now),
++				filters.join(u";;"_q),
++				[=](const FileDialog::OpenResult &result) {
++					if (!result.paths.isEmpty()) {
++						wallpaper->setPath(result.paths.front());
++					}
++				});
++		},
++		.keywords = {
++			u"image"_q,
++			u"video"_q,
++			u"gif"_q,
++			u"mp4"_q,
++		},
++	});
++	builder.addDividerText(tr::lng_sealgram_custom_wallpaper_about());
++	builder.addButton({
++		.id = u"sealgram/appearance/wallpaper/clear"_q,
++		.title = tr::lng_sealgram_clear_wallpaper(),
++		.icon = { &st::menuIconDelete },
++		.onClick = [=] {
++			wallpaper->clear();
++		},
++		.keywords = { u"remove"_q, u"reset"_q, u"clear"_q },
++	});
++	builder.addSkip();
++}
++
++void BuildSealgramSecurity(SectionBuilder &builder) {
++	const auto hardening = Core::GetProcessHardeningStatus();
++
++	builder.addSkip();
++	builder.addSubsectionTitle({
++		.id = u"sealgram/security/status"_q,
++		.title = tr::lng_sealgram_security_about(),
++		.keywords = { u"security"_q, u"protection"_q, u"status"_q },
++	});
++	builder.addButton({
++		.id = u"sealgram/security/tpm"_q,
++		.title = tr::lng_sealgram_tpm(),
++		.st = &st::settingsButtonNoIcon,
++		.label = Storage::details::TpmSealingAvailable()
++			? tr::lng_sealgram_status_available()
++			: tr::lng_sealgram_status_unavailable(),
++		.keywords = { u"tpm"_q, u"seal"_q, u"hardware"_q },
++	});
++	builder.addButton({
++		.id = u"sealgram/security/acg"_q,
++		.title = tr::lng_sealgram_acg(),
++		.st = &st::settingsButtonNoIcon,
++		.label = MitigationStatusText(hardening.acg),
++		.keywords = { u"acg"_q, u"dynamic"_q, u"code"_q },
++	});
++	builder.addButton({
++		.id = u"sealgram/security/cig"_q,
++		.title = tr::lng_sealgram_cig(),
++		.st = &st::settingsButtonNoIcon,
++		.label = MitigationStatusText(hardening.cig),
++		.keywords = { u"cig"_q, u"signature"_q, u"integrity"_q },
++	});
++	builder.addSkip();
++}
++
++// Anything the dashboard shows changes on its own - a probe answers, a switch
++// happens, a download stalls - so the page repaints on a slow tick as well as on
++// the manager's own notifications. Two seconds is unnoticeable as latency and
++// costs nothing next to a settings page that is open for a few seconds.
++constexpr auto kDashboardTick = crl::time(2000);
++
++[[nodiscard]] QString DescribeProxy(const MTP::ProxyData &proxy) {
++	return proxy.host + ':' + QString::number(proxy.port);
++}
++
++[[nodiscard]] rpl::producer<> DashboardChanges() {
++	return rpl::single(rpl::empty) | rpl::then(rpl::merge(
++		Core::App().proxyRotation().stateChanges(),
++		Core::App().settings().proxy().connectionTypeChanges(),
++		base::timer_each(kDashboardTick)));
++}
++
++[[nodiscard]] rpl::producer<QString> ConnectionStateText() {
++	return DashboardChanges() | rpl::map([] {
++		auto connecting = false;
++		for (const auto &entry : Core::App().domain().accounts()) {
++			const auto account = entry.account.get();
++			if (!account->mtpExists() || account->mtp().isTestMode()) {
++				continue;
++			} else if (account->mtp().dcstate() == MTP::ConnectedState) {
++				return tr::lng_sealgram_connection_connected(tr::now);
++			}
++			connecting = true;
++		}
++		return connecting
++			? tr::lng_sealgram_connection_connecting(tr::now)
++			: tr::lng_sealgram_connection_waiting(tr::now);
++	});
++}
++
++[[nodiscard]] rpl::producer<QString> CurrentProxyText() {
++	return DashboardChanges() | rpl::map([] {
++		const auto &proxy = Core::App().settings().proxy();
++		return (proxy.isEnabled() && proxy.selected())
++			? DescribeProxy(proxy.selected())
++			: tr::lng_sealgram_connection_direct(tr::now);
++	});
++}
++
++[[nodiscard]] rpl::producer<QString> CurrentPingText() {
++	return DashboardChanges() | rpl::map([] {
++		for (const auto &status : Core::App().proxyRotation().statuses()) {
++			if (status.current) {
++				return status.responded
++					? tr::lng_sealgram_connection_ping_value(
++						tr::now,
++						lt_ping,
++						QString::number(status.ping))
++					: tr::lng_sealgram_connection_silent(tr::now);
++			}
++		}
++		return QString();
++	});
++}
++
++[[nodiscard]] rpl::producer<QString> MediaHealthText() {
++	return DashboardChanges() | rpl::map([] {
++		const auto stalls = Core::App().proxyRotation().recentMediaStalls();
++		return stalls
++			? tr::lng_sealgram_connection_media_stalls(tr::now, lt_count, stalls)
++			: tr::lng_sealgram_connection_media_ok(tr::now);
++	});
++}
++
++[[nodiscard]] QString DescribeReason(Core::ProxySwitchReason reason) {
++	using Reason = Core::ProxySwitchReason;
++	switch (reason) {
++	case Reason::Manual:
++		return tr::lng_sealgram_connection_reason_manual(tr::now);
++	case Reason::NoConnection:
++		return tr::lng_sealgram_connection_reason_noconnection(tr::now);
++	case Reason::MediaStall:
++		return tr::lng_sealgram_connection_reason_media(tr::now);
++	case Reason::Bootstrap:
++		return tr::lng_sealgram_connection_reason_bootstrap(tr::now);
++	}
++	return QString();
++}
++
++// The proxy list and the switch history both change length, so neither can be
++// built from fixed rows. Both are rebuilt into a plain layout whenever anything
++// moves.
++class DashboardList final : public Ui::RpWidget {
++public:
++	DashboardList(
++		QWidget *parent,
++		Fn<void(not_null<Ui::VerticalLayout*>)> fill);
++
++private:
++	void rebuild();
++
++	object_ptr<Ui::VerticalLayout> _inner;
++	Fn<void(not_null<Ui::VerticalLayout*>)> _fill;
++
++};
++
++DashboardList::DashboardList(
++	QWidget *parent,
++	Fn<void(not_null<Ui::VerticalLayout*>)> fill)
++: RpWidget(parent)
++, _inner(this)
++, _fill(std::move(fill)) {
++	_inner->show();
++	rebuild();
++	DashboardChanges() | rpl::on_next([=] {
++		rebuild();
++	}, lifetime());
++	widthValue() | rpl::on_next([=](int width) {
++		_inner->resizeToWidth(width);
++	}, lifetime());
++	_inner->heightValue() | rpl::on_next([=](int height) {
++		resize(width(), height);
++	}, lifetime());
++}
++
++void DashboardList::rebuild() {
++	while (_inner->count() > 0) {
++		delete _inner->widgetAt(0);
++	}
++	_fill(_inner.data());
++	_inner->resizeToWidth(width());
++}
++
++void FillProxyList(not_null<Ui::VerticalLayout*> container) {
++	const auto statuses = Core::App().proxyRotation().statuses();
++	if (statuses.empty()) {
++		container->add(
++			object_ptr<Ui::FlatLabel>(
++				container,
++				tr::lng_sealgram_connection_none(tr::now),
++				st::boxDividerLabel),
++			st::settingsDividerLabelPadding);
++		return;
++	}
++	for (const auto &status : statuses) {
++		auto notes = QStringList();
++		if (status.current) {
++			notes.push_back(tr::lng_sealgram_connection_current(tr::now));
++		}
++		if (status.mediaFailed) {
++			notes.push_back(tr::lng_sealgram_connection_media_failed(tr::now));
++		}
++		const auto measurement = status.checking
++			? tr::lng_sealgram_connection_checking(tr::now)
++			: status.responded
++			? tr::lng_sealgram_connection_ping_value(
++				tr::now,
++				lt_ping,
++				QString::number(status.ping))
++			: tr::lng_sealgram_connection_silent(tr::now);
++		notes.push_front(measurement);
++
++		const auto proxy = status.proxy;
++		const auto button = container->add(
++			object_ptr<Ui::SettingsButton>(
++				container,
++				rpl::single(DescribeProxy(proxy)),
++				st::settingsButtonNoIcon));
++		Settings::CreateRightLabel(
++			button,
++			rpl::single(notes.join(u", "_q)),
++			st::settingsButtonNoIcon,
++			rpl::single(DescribeProxy(proxy)));
++		button->setClickedCallback([=] {
++			// Switching by hand also cancels whatever the rotation was in the
++			// middle of, so the choice is not undone a second later.
++			Core::App().setCurrentProxy(
++				proxy,
++				MTP::ProxyData::Settings::Enabled);
++			Core::App().saveSettingsDelayed();
++		});
++	}
++}
++
++void FillSwitchHistory(not_null<Ui::VerticalLayout*> container) {
++	const auto &history = Core::App().proxyRotation().history();
++	if (history.empty()) {
++		container->add(
++			object_ptr<Ui::FlatLabel>(
++				container,
++				tr::lng_sealgram_connection_history_empty(tr::now),
++				st::boxDividerLabel),
++			st::settingsDividerLabelPadding);
++		return;
++	}
++	for (const auto &record : history) {
++		const auto when = base::unixtime::parse(record.when).toString("HH:mm");
++		const auto text = record.from.isEmpty()
++			? u"%1  %2"_q.arg(when, record.to)
++			: u"%1  %2 → %3"_q.arg(when, record.from, record.to);
++		container->add(
++			object_ptr<Ui::FlatLabel>(
++				container,
++				text + u" — "_q + DescribeReason(record.reason),
++				st::boxDividerLabel),
++			st::settingsDividerLabelPadding);
++	}
++}
++
++void BuildSealgramConnection(SectionBuilder &builder) {
++	builder.addSkip();
++	builder.addSubsectionTitle(tr::lng_sealgram_connection_state());
++	builder.addButton({
++		.id = u"sealgram/connection/state"_q,
++		.title = tr::lng_sealgram_connection_state(),
++		.st = &st::settingsButtonNoIcon,
++		.label = ConnectionStateText(),
++		.keywords = { u"connection"_q, u"status"_q },
++	});
++	builder.addButton({
++		.id = u"sealgram/connection/proxy"_q,
++		.title = tr::lng_sealgram_connection_proxy(),
++		.st = &st::settingsButtonNoIcon,
++		.label = CurrentProxyText(),
++		.keywords = { u"proxy"_q, u"current"_q },
++	});
++	builder.addButton({
++		.id = u"sealgram/connection/ping"_q,
++		.title = tr::lng_sealgram_connection_ping(),
++		.st = &st::settingsButtonNoIcon,
++		.label = CurrentPingText(),
++		.keywords = { u"ping"_q, u"latency"_q },
++	});
++	builder.addButton({
++		.id = u"sealgram/connection/media"_q,
++		.title = tr::lng_sealgram_connection_media(),
++		.st = &st::settingsButtonNoIcon,
++		.label = MediaHealthText(),
++		.keywords = { u"media"_q, u"downloads"_q },
++	});
++	builder.addDividerText(tr::lng_sealgram_connection_about());
++
++	builder.addSkip();
++	builder.addSubsectionTitle(tr::lng_sealgram_connection_list());
++	builder.addControl({
++		.factory = [](not_null<Ui::VerticalLayout*> parent) {
++			return object_ptr<DashboardList>(parent, FillProxyList);
++		},
++		.id = u"sealgram/connection/list"_q,
++		.title = tr::lng_sealgram_connection_list(),
++		.keywords = { u"proxy"_q, u"list"_q, u"ping"_q },
++	});
++	builder.addButton({
++		.id = u"sealgram/connection/measure"_q,
++		.title = tr::lng_sealgram_connection_measure(),
++		.icon = { &st::menuIconRefresh },
++		.onClick = [] { Core::App().proxyRotation().probeAll(); },
++		.keywords = { u"measure"_q, u"ping"_q, u"refresh"_q },
++	});
++
++	builder.addSkip();
++	builder.addSubsectionTitle(tr::lng_sealgram_connection_history());
++	builder.addControl({
++		.factory = [](not_null<Ui::VerticalLayout*> parent) {
++			return object_ptr<DashboardList>(parent, FillSwitchHistory);
++		},
++		.id = u"sealgram/connection/history"_q,
++		.title = tr::lng_sealgram_connection_history(),
++		.keywords = { u"history"_q, u"switch"_q },
++	});
++	builder.addSkip();
++}
++
++void BuildSealgramNetwork(SectionBuilder &builder) {
++	const auto enabled = Core::App().sealgramProxyFeedEnabled();
++
++	builder.addSkip();
++	builder.addSectionButton({
++		.title = tr::lng_sealgram_connection(),
++		.targetSection = SealgramConnection::Id(),
++		.icon = { &st::menuIconNetwork },
++		.keywords = { u"connection"_q, u"ping"_q, u"status"_q },
++	});
++	const auto toggle = builder.addButton({
++		.id = u"sealgram/network/proxy-feed"_q,
++		.title = tr::lng_sealgram_proxy_feed(),
++		.st = &st::settingsButtonNoIcon,
++		.toggled = rpl::single(enabled),
++		.keywords = { u"proxy"_q, u"feed"_q, u"automatic"_q },
++	});
++	if (toggle) {
++		toggle->toggledValue(
++		) | rpl::filter([](bool value) {
++			return value != Core::App().sealgramProxyFeedEnabled();
++		}) | rpl::on_next([](bool value) {
++			Core::App().setSealgramProxyFeedEnabled(value);
++			if (value) {
++				Core::App().refreshProxyFeed();
++			}
++		}, toggle->lifetime());
++	}
++	builder.addButton({
++		.id = u"sealgram/network/proxies"_q,
++		.title = tr::lng_sealgram_proxies_rotation(),
++		.icon = { &st::menuIconNetwork },
++		.onClick = [controller = builder.controller()] {
++			ProxiesBoxController::Show(controller);
++		},
++		.keywords = { u"proxy"_q, u"rotation"_q, u"connection"_q },
++	});
++	builder.addSkip();
++}
++
++void BuildSealgramUpdates(SectionBuilder &builder) {
++	const auto enabled = Core::App().sealgramUpdateChecksEnabled();
++
++	builder.addSkip();
++	const auto toggle = builder.addButton({
++		.id = u"sealgram/updates/automatic"_q,
++		.title = tr::lng_sealgram_update_automatic(),
++		.st = &st::settingsButtonNoIcon,
++		.toggled = rpl::single(enabled),
++		.keywords = { u"update"_q, u"automatic"_q, u"notification"_q },
++	});
++	if (toggle) {
++		toggle->toggledValue(
++		) | rpl::filter([](bool value) {
++			return value != Core::App().sealgramUpdateChecksEnabled();
++		}) | rpl::on_next([](bool value) {
++			Core::App().setSealgramUpdateChecksEnabled(value);
++		}, toggle->lifetime());
++	}
++	builder.addButton({
++		.id = u"sealgram/updates/version"_q,
++		.title = tr::lng_sealgram_current_version(),
++		.st = &st::settingsButtonNoIcon,
++		.label = rpl::single(QString::fromLatin1(AppVersionStr)),
++		.keywords = { u"version"_q, u"current"_q },
++	});
++	builder.addButton({
++		.id = u"sealgram/updates/check"_q,
++		.title = tr::lng_sealgram_check_updates(),
++		.icon = { &st::menuIconDownload },
++		.onClick = [] {
++			Core::App().checkSealgramUpdate(Core::UpdateCheckSource::Manual);
++		},
++		.keywords = { u"update"_q, u"check"_q, u"download"_q },
++	});
++	builder.addSkip();
++}
++
++const auto kSealgramMeta = BuildHelper({
++	.id = SealgramSection::Id(),
++	.parentId = MainId(),
++	.title = &tr::lng_sealgram_settings,
++	.icon = &st::menuIconStar,
++}, [](SectionBuilder &builder) {
++	BuildSealgram(builder);
++});
++
++const auto kSealgramSecurityMeta = BuildHelper({
++	.id = SealgramSecurity::Id(),
++	.parentId = SealgramSection::Id(),
++	.title = &tr::lng_sealgram_security,
++	.icon = &st::menuIconLock,
++}, [](SectionBuilder &builder) {
++	BuildSealgramSecurity(builder);
++});
++
++const auto kSealgramPrivacyMeta = BuildHelper({
++	.id = SealgramPrivacy::Id(),
++	.parentId = SealgramSection::Id(),
++	.title = &tr::lng_sealgram_privacy,
++	.icon = &st::menuIconPermissions,
++}, [](SectionBuilder &builder) {
++	BuildSealgramPrivacy(builder);
++});
++
++const auto kSealgramAppearanceMeta = BuildHelper({
++	.id = SealgramAppearance::Id(),
++	.parentId = SealgramSection::Id(),
++	.title = &tr::lng_sealgram_appearance,
++	.icon = &st::menuIconPhoto,
++}, [](SectionBuilder &builder) {
++	BuildSealgramAppearance(builder);
++});
++
++const auto kSealgramNetworkMeta = BuildHelper({
++	.id = SealgramNetwork::Id(),
++	.parentId = SealgramSection::Id(),
++	.title = &tr::lng_sealgram_network,
++	.icon = &st::menuIconNetwork,
++}, [](SectionBuilder &builder) {
++	BuildSealgramNetwork(builder);
++});
++
++const auto kSealgramConnectionMeta = BuildHelper({
++	.id = SealgramConnection::Id(),
++	.parentId = SealgramNetwork::Id(),
++	.title = &tr::lng_sealgram_connection,
++	.icon = &st::menuIconNetwork,
++}, [](SectionBuilder &builder) {
++	BuildSealgramConnection(builder);
++});
++
++const auto kSealgramUpdatesMeta = BuildHelper({
++	.id = SealgramUpdates::Id(),
++	.parentId = SealgramSection::Id(),
++	.title = &tr::lng_sealgram_updates,
++	.icon = &st::menuIconDownload,
++}, [](SectionBuilder &builder) {
++	BuildSealgramUpdates(builder);
++});
++
++const SectionBuildMethod kSealgramSection = kSealgramMeta.build;
++const SectionBuildMethod kSealgramSecuritySection = kSealgramSecurityMeta.build;
++const SectionBuildMethod kSealgramPrivacySection = kSealgramPrivacyMeta.build;
++const SectionBuildMethod kSealgramAppearanceSection
++	= kSealgramAppearanceMeta.build;
++const SectionBuildMethod kSealgramNetworkSection = kSealgramNetworkMeta.build;
++const SectionBuildMethod kSealgramConnectionSection
++	= kSealgramConnectionMeta.build;
++const SectionBuildMethod kSealgramUpdatesSection = kSealgramUpdatesMeta.build;
++
++SealgramSection::SealgramSection(
++	QWidget *parent,
++	not_null<Window::SessionController*> controller)
++: Section(parent, controller) {
++	setupContent();
++}
++
++rpl::producer<QString> SealgramSection::title() {
++	return tr::lng_sealgram_settings();
++}
++
++void SealgramSection::setupContent() {
++	const auto content = Ui::CreateChild<Ui::VerticalLayout>(this);
++	build(content, kSealgramSection);
++	Ui::ResizeFitChild(this, content);
++}
++
++SealgramSecurity::SealgramSecurity(
++	QWidget *parent,
++	not_null<Window::SessionController*> controller)
++: Section(parent, controller) {
++	setupContent();
++}
++
++rpl::producer<QString> SealgramSecurity::title() {
++	return tr::lng_sealgram_security();
++}
++
++void SealgramSecurity::setupContent() {
++	const auto content = Ui::CreateChild<Ui::VerticalLayout>(this);
++	build(content, kSealgramSecuritySection);
++	Ui::ResizeFitChild(this, content);
++}
++
++SealgramNetwork::SealgramNetwork(
++	QWidget *parent,
++	not_null<Window::SessionController*> controller)
++: Section(parent, controller) {
++	setupContent();
++}
++
++SealgramPrivacy::SealgramPrivacy(
++	QWidget *parent,
++	not_null<Window::SessionController*> controller)
++: Section(parent, controller) {
++	setupContent();
++}
++
++rpl::producer<QString> SealgramPrivacy::title() {
++	return tr::lng_sealgram_privacy();
++}
++
++void SealgramPrivacy::setupContent() {
++	const auto content = Ui::CreateChild<Ui::VerticalLayout>(this);
++	build(content, kSealgramPrivacySection);
++	Ui::ResizeFitChild(this, content);
++}
++
++SealgramAppearance::SealgramAppearance(
++	QWidget *parent,
++	not_null<Window::SessionController*> controller)
++: Section(parent, controller) {
++	setupContent();
++}
++
++rpl::producer<QString> SealgramAppearance::title() {
++	return tr::lng_sealgram_appearance();
++}
++
++void SealgramAppearance::setupContent() {
++	const auto content = Ui::CreateChild<Ui::VerticalLayout>(this);
++	build(content, kSealgramAppearanceSection);
++	Ui::ResizeFitChild(this, content);
++}
++
++rpl::producer<QString> SealgramNetwork::title() {
++	return tr::lng_sealgram_network();
++}
++
++void SealgramNetwork::setupContent() {
++	const auto content = Ui::CreateChild<Ui::VerticalLayout>(this);
++	build(content, kSealgramNetworkSection);
++	Ui::ResizeFitChild(this, content);
++}
++
++SealgramConnection::SealgramConnection(
++	QWidget *parent,
++	not_null<Window::SessionController*> controller)
++: Section(parent, controller) {
++	setupContent();
++}
++
++rpl::producer<QString> SealgramConnection::title() {
++	return tr::lng_sealgram_connection();
++}
++
++void SealgramConnection::setupContent() {
++	const auto content = Ui::CreateChild<Ui::VerticalLayout>(this);
++	build(content, kSealgramConnectionSection);
++	Ui::ResizeFitChild(this, content);
++}
++
++SealgramUpdates::SealgramUpdates(
++	QWidget *parent,
++	not_null<Window::SessionController*> controller)
++: Section(parent, controller) {
++	setupContent();
++}
++
++rpl::producer<QString> SealgramUpdates::title() {
++	return tr::lng_sealgram_updates();
++}
++
++void SealgramUpdates::setupContent() {
++	const auto content = Ui::CreateChild<Ui::VerticalLayout>(this);
++	build(content, kSealgramUpdatesSection);
++	Ui::ResizeFitChild(this, content);
++}
++
++} // namespace
++
++Type SealgramId() {
++	return SealgramSection::Id();
++}
++
++Type SealgramSecurityId() {
++	return SealgramSecurity::Id();
++}
++
++Type SealgramPrivacyId() {
++	return SealgramPrivacy::Id();
++}
++
++Type SealgramAppearanceId() {
++	return SealgramAppearance::Id();
++}
++
++Type SealgramNetworkId() {
++	return SealgramNetwork::Id();
++}
++
++Type SealgramConnectionId() {
++	return SealgramConnection::Id();
++}
++
++Type SealgramUpdatesId() {
++	return SealgramUpdates::Id();
++}
++
++} // namespace Settings
+diff --git a/Telegram/SourceFiles/settings/sections/settings_sealgram.h b/Telegram/SourceFiles/settings/sections/settings_sealgram.h
+new file mode 100644
+index 0000000..b46c51c
+--- /dev/null
++++ b/Telegram/SourceFiles/settings/sections/settings_sealgram.h
+@@ -0,0 +1,22 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include "settings/settings_type.h"
++
++namespace Settings {
++
++[[nodiscard]] Type SealgramId();
++[[nodiscard]] Type SealgramSecurityId();
++[[nodiscard]] Type SealgramPrivacyId();
++[[nodiscard]] Type SealgramAppearanceId();
++[[nodiscard]] Type SealgramNetworkId();
++[[nodiscard]] Type SealgramConnectionId();
++[[nodiscard]] Type SealgramUpdatesId();
++
++} // namespace Settings
+diff --git a/Telegram/SourceFiles/settings/settings.style b/Telegram/SourceFiles/settings/settings.style
+index 6697251..be20f01 100644
+--- a/Telegram/SourceFiles/settings/settings.style
++++ b/Telegram/SourceFiles/settings/settings.style
+@@ -241,6 +241,12 @@ settingsCoverStatus: FlatLabel(defaultFlatLabel) {
+ 	textFg: windowSubTextFg;
+ }
+ 
++sealgramCoverHeight: 210px;
++sealgramCoverLogoSize: 88px;
++sealgramCoverLogoTop: 22px;
++sealgramCoverTitleTop: 124px;
++sealgramCoverDescriptionTop: 154px;
++
+ settingsThemesTopSkip: 10px;
+ settingsThemesBottomSkip: 8px;
+ settingsTheme: Checkbox(defaultCheckbox) {
+-- 
+2.54.0.windows.1
+

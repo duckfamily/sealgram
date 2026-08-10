@@ -1,0 +1,326 @@
+From 811c62c790beb6a130f55633b4ab07a88d824dfd Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:32:34 +0300
+Subject: [PATCH 03/13] Fetch a signed list of MTProto proxies over plain HTTPS
+
+A client that cannot reach Telegram cannot read a Telegram channel to find
+a proxy. This asks a host that stays reachable when Telegram is not.
+
+The payload is verified with Ed25519 against a key compiled into the
+binary, so the list cannot be re-pointed by anyone who does not control
+this build. A response failing verification is discarded loudly. Ed25519
+signs the message rather than a digest of it, so EVP_DigestVerify is used
+and not the Update/Final pair.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Telegram/SourceFiles/mtproto/proxy_feed.cpp | 225 ++++++++++++++++++++
+ Telegram/SourceFiles/mtproto/proxy_feed.h   |  64 ++++++
+ 2 files changed, 289 insertions(+)
+ create mode 100644 Telegram/SourceFiles/mtproto/proxy_feed.cpp
+ create mode 100644 Telegram/SourceFiles/mtproto/proxy_feed.h
+
+diff --git a/Telegram/SourceFiles/mtproto/proxy_feed.cpp b/Telegram/SourceFiles/mtproto/proxy_feed.cpp
+new file mode 100644
+index 0000000..8bb7cc4
+--- /dev/null
++++ b/Telegram/SourceFiles/mtproto/proxy_feed.cpp
+@@ -0,0 +1,225 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#include "mtproto/proxy_feed.h"
++
++#include "base/openssl_help.h"
++#include "logs.h"
++#include "settings.h"
++
++#include <QtCore/QFile>
++#include <QtCore/QJsonArray>
++#include <QtCore/QJsonDocument>
++#include <QtCore/QJsonObject>
++#include <QtNetwork/QNetworkAccessManager>
++#include <QtNetwork/QNetworkReply>
++#include <QtNetwork/QNetworkRequest>
++
++#include <openssl/evp.h>
++
++namespace MTP {
++namespace {
++
++constexpr auto kFeedUrl = "https://tg-proxy-feed.vercel.app/api/proxies";
++
++// Nothing larger than this can be a legitimate list, and refusing early keeps
++// a hostile or broken host from making us buffer whatever it likes.
++constexpr auto kMaxResponseBytes = 128 * 1024;
++
++constexpr auto kTimeoutMs = 15 * 1000;
++
++// Ed25519 public key matching the private key held by the feed. Changing the
++// feed's key means shipping a new binary, which is the intended property: the
++// list cannot be re-pointed by anyone who does not control this build.
++constexpr unsigned char kFeedPublicKey[32] = {
++	0x24, 0xa2, 0x84, 0xbf, 0x58, 0xfb, 0xf7, 0xf4,
++	0x16, 0x38, 0x65, 0x7a, 0x6c, 0x33, 0x75, 0xb3,
++	0x55, 0x5a, 0x1f, 0x8c, 0x2a, 0x0a, 0x89, 0x97,
++	0x78, 0xc4, 0xfe, 0xea, 0xfb, 0xff, 0x32, 0xba,
++};
++
++[[nodiscard]] QString StateFilePath() {
++	return cWorkingDir() + u"tdata/proxy_feed"_q;
++}
++
++[[nodiscard]] ProxyFeedResult ParsePayload(const QByteArray &payload) {
++	auto error = QJsonParseError();
++	const auto document = QJsonDocument::fromJson(payload, &error);
++	if (error.error != QJsonParseError::NoError || !document.isObject()) {
++		return {};
++	}
++	const auto object = document.object();
++
++	// An unknown version may have changed what a field means, and guessing
++	// about proxy definitions is not a good way to be wrong.
++	if (object.value("version").toInt() != 2) {
++		LOG(("Proxy feed: unsupported payload version."));
++		return {};
++	}
++
++	auto result = ProxyFeedResult();
++	result.expires = TimeId(object.value("expires").toDouble());
++
++	const auto array = object.value("proxies").toArray();
++	result.proxies.reserve(array.size());
++	for (const auto &entry : array) {
++		const auto proxy = entry.toObject();
++		const auto host = proxy.value("server").toString();
++		const auto port = proxy.value("port").toInt();
++		const auto secret = proxy.value("secret").toString();
++		if (host.isEmpty()
++			|| port <= 0
++			|| port > 65535
++			|| !ProxyData::ValidMtprotoPassword(secret)) {
++			continue;
++		}
++		auto data = ProxyData();
++		data.type = ProxyData::Type::Mtproto;
++		data.host = host;
++		data.port = uint32(port);
++		data.password = secret;
++		if (data.valid()) {
++			result.proxies.push_back(data);
++		}
++	}
++	return result;
++}
++
++} // namespace
++
++bool VerifyProxyFeedSignature(
++		const QByteArray &payload,
++		const QByteArray &signature) {
++	if (payload.isEmpty() || signature.size() != 64) {
++		return false;
++	}
++
++	const auto key = EVP_PKEY_new_raw_public_key(
++		EVP_PKEY_ED25519,
++		nullptr,
++		kFeedPublicKey,
++		sizeof(kFeedPublicKey));
++	if (!key) {
++		return false;
++	}
++	const auto keyGuard = gsl::finally([&] { EVP_PKEY_free(key); });
++
++	const auto context = EVP_MD_CTX_new();
++	if (!context) {
++		return false;
++	}
++	const auto contextGuard = gsl::finally([&] { EVP_MD_CTX_free(context); });
++
++	if (EVP_DigestVerifyInit(context, nullptr, nullptr, nullptr, key) != 1) {
++		return false;
++	}
++
++	// Ed25519 is a one-shot algorithm: it signs the message, not a digest of
++	// it, so EVP_DigestVerify is used rather than Update plus Final.
++	return EVP_DigestVerify(
++		context,
++		reinterpret_cast<const unsigned char*>(signature.constData()),
++		size_t(signature.size()),
++		reinterpret_cast<const unsigned char*>(payload.constData()),
++		size_t(payload.size())) == 1;
++}
++
++KnownFeedProxies LoadKnownFeedProxies() {
++	auto file = QFile(StateFilePath());
++	if (!file.open(QIODevice::ReadOnly)) {
++		return {};
++	}
++	const auto document = QJsonDocument::fromJson(file.readAll());
++	if (!document.isObject()) {
++		return {};
++	}
++	const auto object = document.object();
++
++	auto result = KnownFeedProxies();
++	result.expires = TimeId(object.value("expires").toDouble());
++	for (const auto &entry : object.value("keys").toArray()) {
++		const auto key = entry.toString();
++		if (!key.isEmpty()) {
++			result.keys.push_back(key);
++		}
++	}
++	return result;
++}
++
++void SaveKnownFeedProxies(const KnownFeedProxies &value) {
++	auto keys = QJsonArray();
++	for (const auto &key : value.keys) {
++		keys.append(key);
++	}
++	auto object = QJsonObject();
++	object.insert("keys", keys);
++	object.insert("expires", double(value.expires));
++
++	auto file = QFile(StateFilePath());
++	if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
++		LOG(("Proxy feed: could not save state."));
++		return;
++	}
++	file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
++}
++
++void RequestProxyFeed(Fn<void(ProxyFeedResult)> done) {
++	const auto manager = new QNetworkAccessManager();
++
++	auto request = QNetworkRequest(QUrl(kFeedUrl));
++	request.setTransferTimeout(kTimeoutMs);
++	request.setAttribute(
++		QNetworkRequest::RedirectPolicyAttribute,
++		QNetworkRequest::NoLessSafeRedirectPolicy);
++
++	const auto reply = manager->get(request);
++
++	QObject::connect(reply, &QNetworkReply::finished, [=] {
++		const auto guard = gsl::finally([&] {
++			reply->deleteLater();
++			manager->deleteLater();
++		});
++
++		if (reply->error() != QNetworkReply::NoError) {
++			LOG(("Proxy feed: request failed: %1").arg(reply->errorString()));
++			done({});
++			return;
++		}
++		const auto body = reply->readAll();
++		if (body.size() > kMaxResponseBytes) {
++			LOG(("Proxy feed: response too large, ignoring."));
++			done({});
++			return;
++		}
++
++		auto error = QJsonParseError();
++		const auto document = QJsonDocument::fromJson(body, &error);
++		if (error.error != QJsonParseError::NoError || !document.isObject()) {
++			LOG(("Proxy feed: response is not JSON."));
++			done({});
++			return;
++		}
++		const auto object = document.object();
++		const auto payload = object.value("payload").toString().toUtf8();
++		const auto signature = QByteArray::fromBase64(
++			object.value("signature").toString().toUtf8());
++
++		if (!VerifyProxyFeedSignature(payload, signature)) {
++			// Deliberately loud: this is either a broken deployment or somebody
++			// trying to choose which proxies we use.
++			LOG(("Proxy feed: SIGNATURE INVALID, discarding the list."));
++			done({});
++			return;
++		}
++
++		auto result = ParsePayload(payload);
++		LOG(("Proxy feed: %1 proxies accepted.").arg(result.proxies.size()));
++		done(std::move(result));
++	});
++}
++
++} // namespace MTP
+diff --git a/Telegram/SourceFiles/mtproto/proxy_feed.h b/Telegram/SourceFiles/mtproto/proxy_feed.h
+new file mode 100644
+index 0000000..ae3d0bf
+--- /dev/null
++++ b/Telegram/SourceFiles/mtproto/proxy_feed.h
+@@ -0,0 +1,64 @@
++/*
++This file is part of Telegram Desktop,
++the official desktop application for the Telegram messaging service.
++
++For license and copyright information please follow this link:
++https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
++*/
++#pragma once
++
++#include "mtproto/mtproto_proxy_data.h"
++
++#include <vector>
++
++namespace MTP {
++
++struct ProxyFeedResult {
++	std::vector<ProxyData> proxies;
++
++	// Unix time after which the whole list is to be considered dead, even if
++	// the feed stops answering. A public MTProto proxy rarely lasts a day.
++	TimeId expires = 0;
++
++	[[nodiscard]] bool empty() const {
++		return proxies.empty();
++	}
++};
++
++// Fetches a signed list of MTProto proxies over ordinary HTTPS.
++//
++// This exists to break a circular dependency: a client that cannot reach
++// Telegram cannot read a Telegram channel to find a proxy. The feed is served
++// from a host that is reachable when Telegram is not, so discovery happens
++// over a request that looks like any other web traffic.
++//
++// The list is signed with Ed25519 and verified against a key compiled into
++// this binary. A response that fails verification is discarded without a
++// second thought: an unsigned or forged list is an invitation to route all
++// traffic through somebody else's server.
++//
++// Delivers an empty result on any failure - no network, bad signature,
++// malformed payload. Callers should treat that as "no new proxies", never as
++// an error worth bothering the user about.
++void RequestProxyFeed(Fn<void(ProxyFeedResult)> done);
++
++// Which proxies the feed gave us last time, and when they stop counting.
++//
++// Kept apart from the user's own proxy list so that expiry only ever removes
++// what the feed added. Deleting an entry somebody typed in by hand - possibly
++// the only one that works for them - would be unforgivable.
++struct KnownFeedProxies {
++	std::vector<QString> keys; // "host:port"
++	TimeId expires = 0;
++};
++
++[[nodiscard]] KnownFeedProxies LoadKnownFeedProxies();
++void SaveKnownFeedProxies(const KnownFeedProxies &value);
++
++// Verification exposed for tests. `payload` must be the exact bytes that were
++// signed, not a re-serialisation of them.
++[[nodiscard]] bool VerifyProxyFeedSignature(
++	const QByteArray &payload,
++	const QByteArray &signature);
++
++} // namespace MTP
+-- 
+2.54.0.windows.1
+

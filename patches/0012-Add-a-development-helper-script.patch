@@ -1,0 +1,251 @@
+From 72d162c62581b76954f5b38c11fb2ea802218fd7 Mon Sep 17 00:00:00 2001
+From: duckfamily <156525766+duckfamily@users.noreply.github.com>
+Date: Tue, 11 Aug 2026 02:35:26 +0300
+Subject: [PATCH 12/13] Add a development helper script
+
+Two mistakes cost more time than any bug on this project: forgetting a build
+flag, and trusting a green build that had silently used a stale resource.
+Both are now commands.
+
+  check    binary newer than sources, compiled resources newer than the art
+           they were made from, file properties actually renamed
+  refresh  clear the AUTORCC stamps, the only way to make Qt notice that a
+           file listed in a .qrc changed content
+  smoke    launch, confirm it survives startup, confirm the hardening line
+           reached the log, report any assertion
+  run      launch the portable profile, optionally setting a wallpaper
+           without clicking through the interface
+
+The build command carries /m:1 /p:CL_MPCount=3 so it cannot be forgotten,
+and stops the running client first, because a relink over a running binary
+fails with LNK1104 and says nothing about why.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ Telegram/build/sealgram_dev.ps1 | 214 ++++++++++++++++++++++++++++++++
+ 1 file changed, 214 insertions(+)
+ create mode 100644 Telegram/build/sealgram_dev.ps1
+
+diff --git a/Telegram/build/sealgram_dev.ps1 b/Telegram/build/sealgram_dev.ps1
+new file mode 100644
+index 0000000..14049c7
+--- /dev/null
++++ b/Telegram/build/sealgram_dev.ps1
+@@ -0,0 +1,214 @@
++# Sealgram development helper.
++#
++# Exists because the same twenty lines of PowerShell were being retyped for
++# every change, and because two of the mistakes that cost the most time were
++# forgetting a build flag and trusting a green build that had silently used a
++# stale resource.
++#
++#   .\sealgram_dev.ps1 build        rebuild with the flags that actually work
++#   .\sealgram_dev.ps1 run          launch the portable profile
++#   .\sealgram_dev.ps1 run -Clean   ...after wiping the log
++#   .\sealgram_dev.ps1 log Proxy    show matching log lines
++#   .\sealgram_dev.ps1 check        verify the build is what it claims to be
++#   .\sealgram_dev.ps1 smoke        launch, check it lives, read the log, quit
++#   .\sealgram_dev.ps1 installer    compile the Inno Setup installer
++#   .\sealgram_dev.ps1 refresh      force Qt to regenerate the resources
++
++[CmdletBinding()]
++param(
++    [Parameter(Position = 0)]
++    [ValidateSet('build', 'run', 'log', 'check', 'smoke', 'installer', 'refresh')]
++    [string]$Command = 'check',
++
++    [Parameter(Position = 1)]
++    [string]$Argument,
++
++    [switch]$Clean
++)
++
++$ErrorActionPreference = 'Stop'
++
++$Root      = 'G:\src\tdesktop'
++$Out       = "$Root\out"
++$Release   = "$Out\Release"
++$Exe       = "$Release\Sealgram.exe"
++$Portable  = "$Release\SealgramForcePortable"
++$Log       = "$Portable\log.txt"
++$CMake     = 'G:\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
++$ISCC      = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
++
++# Three concurrent compilers, not more. Six survives an incremental build of a
++# few files and fails a full rebuild with C1076, which reads like a broken
++# source change and is actually the machine running out of memory.
++$BuildArgs = @('--build', '.', '--config', 'Release', '--', '/m:1', '/p:CL_MPCount=3')
++
++function Stop-Sealgram {
++    $running = Get-Process Sealgram -ErrorAction SilentlyContinue
++    if (-not $running) { return }
++    $running | ForEach-Object { $_.CloseMainWindow() | Out-Null }
++    Start-Sleep -Seconds 3
++    Get-Process Sealgram -ErrorAction SilentlyContinue |
++        Stop-Process -Force -ErrorAction SilentlyContinue
++    Start-Sleep -Seconds 1
++}
++
++function Invoke-Build {
++    # The binary cannot be relinked while it is running; the failure is
++    # LNK1104 and says nothing about the real cause.
++    Stop-Sealgram
++    Push-Location $Out
++    try {
++        & $CMake @BuildArgs 2>&1 |
++            Select-String -Pattern 'error|warning C|LNK[0-9]|Sealgram\.exe' |
++            Select-Object -Last 30
++    } finally {
++        Pop-Location
++    }
++    if ($LASTEXITCODE -ne 0) {
++        Write-Host "BUILD FAILED (exit $LASTEXITCODE)" -ForegroundColor Red
++        return
++    }
++    Write-Host "built: $((Get-Item $Exe).LastWriteTime)" -ForegroundColor Green
++}
++
++function Invoke-Refresh {
++    # Qt's AUTORCC watches the .qrc files, not the files they list. Replace an
++    # icon and nothing in the build system notices. Deleting the generated .cpp
++    # alone is not enough either - autogen still believes it is up to date and
++    # the build then fails on missing includes. The bookkeeping is what has to
++    # go.
++    $dir = "$Out\Telegram\CMakeFiles\Telegram_autogen.dir"
++    if (-not (Test-Path $dir)) {
++        Write-Host "no autogen directory at $dir" -ForegroundColor Yellow
++        return
++    }
++    $used = Get-ChildItem $dir -Filter '*_Used_Release.txt' -ErrorAction SilentlyContinue
++    $used | ForEach-Object { Remove-Item $_.FullName -Force }
++    $cache = "$dir\ParseCache_Release.txt"
++    if (Test-Path $cache) { Remove-Item $cache -Force }
++    Write-Host "cleared $($used.Count) resource stamps; rebuild to regenerate" -ForegroundColor Green
++}
++
++function Invoke-Run {
++    Stop-Sealgram
++    if ($Clean -and (Test-Path $Log)) { Remove-Item $Log -Force }
++    if ($Argument) {
++        # A wallpaper can be set without clicking through the interface.
++        $path = (Resolve-Path $Argument).Path -replace '\\', '/'
++        New-Item -ItemType Directory -Force -Path "$Portable\tdata" | Out-Null
++        [System.IO.File]::WriteAllText(
++            "$Portable\tdata\sealgram_wallpaper",
++            "{`"version`":1,`"path`":`"$path`"}")
++        Write-Host "wallpaper set to $path"
++    }
++    Start-Process -FilePath $Exe -WorkingDirectory $Release
++    Write-Host "launched" -ForegroundColor Green
++}
++
++function Invoke-Log {
++    if (-not (Test-Path $Log)) { Write-Host 'no log yet'; return }
++    $pattern = if ($Argument) { $Argument } else { 'Wallpaper|Proxy|hardening|Error|Assertion' }
++    Select-String -Path $Log -Pattern $pattern | ForEach-Object {
++        # Some upstream lines are a full page of OpenGL extensions.
++        if ($_.Line.Length -gt 160) { $_.Line.Substring(0, 160) + '...' } else { $_.Line }
++    }
++}
++
++function Test-Build {
++    $ok = $true
++    $report = {
++        param($name, $passed, $detail)
++        $mark = if ($passed) { 'ok  ' } else { 'FAIL' }
++        $colour = if ($passed) { 'Green' } else { 'Red' }
++        Write-Host ("{0}  {1,-34} {2}" -f $mark, $name, $detail) -ForegroundColor $colour
++    }
++
++    if (-not (Test-Path $Exe)) {
++        & $report 'binary exists' $false 'no Sealgram.exe'
++        return
++    }
++    $exeTime = (Get-Item $Exe).LastWriteTime
++    & $report 'binary exists' $true $exeTime
++
++    # Newer sources than the binary mean the last build did not include them.
++    $newest = Get-ChildItem "$Root\Telegram\SourceFiles" -Recurse -Include *.cpp, *.h |
++        Sort-Object LastWriteTime -Descending | Select-Object -First 1
++    $fresh = ($newest.LastWriteTime -le $exeTime)
++    $ok = $ok -and $fresh
++    & $report 'binary newer than sources' $fresh $newest.Name
++
++    # The trap that cost an afternoon: a green build carrying a day-old picture.
++    $art = Get-ChildItem "$Root\Telegram\Resources\art" -File |
++        Sort-Object LastWriteTime -Descending | Select-Object -First 1
++    $qrc = Get-ChildItem "$Out\Telegram\Telegram_autogen\include_Release" -Recurse `
++        -Filter 'qrc_telegram_CMAKE_.cpp' -ErrorAction SilentlyContinue |
++        Select-Object -First 1
++    if ($qrc) {
++        $current = ($qrc.LastWriteTime -ge $art.LastWriteTime)
++        $ok = $ok -and $current
++        & $report 'compiled resources current' $current `
++            ("art $($art.LastWriteTime.ToString('MM-dd HH:mm')), qrc $($qrc.LastWriteTime.ToString('MM-dd HH:mm'))")
++    } else {
++        & $report 'compiled resources current' $false 'no generated resource found'
++        $ok = $false
++    }
++
++    # Proves the rename reached the binary rather than only the source.
++    $info = (Get-Item $Exe).VersionInfo
++    $named = ($info.ProductName -eq 'Sealgram')
++    $ok = $ok -and $named
++    & $report 'file properties renamed' $named $info.ProductName
++
++    if (-not $ok) {
++        Write-Host "`nSomething is stale. 'refresh' then 'build' fixes the resource case." -ForegroundColor Yellow
++    }
++}
++
++function Invoke-Smoke {
++    Stop-Sealgram
++    if (Test-Path $Log) { Remove-Item $Log -Force }
++    Start-Process -FilePath $Exe -WorkingDirectory $Release
++    Write-Host 'waiting for startup...'
++    Start-Sleep -Seconds 25
++
++    $process = Get-Process Sealgram -ErrorAction SilentlyContinue
++    if (-not $process) {
++        Write-Host 'FAIL  process died during startup' -ForegroundColor Red
++        if (Test-Path $Log) { Get-Content $Log -Tail 5 }
++        return
++    }
++    Write-Host ("ok    running, {0} MB" -f [math]::Round($process.WorkingSet64 / 1MB)) -ForegroundColor Green
++
++    $hardening = Select-String -Path $Log -Pattern 'Process hardening' | Select-Object -First 1
++    if ($hardening) {
++        Write-Host "ok    $($hardening.Line)" -ForegroundColor Green
++    } else {
++        Write-Host 'FAIL  no hardening line in the log' -ForegroundColor Red
++    }
++    Select-String -Path $Log -Pattern 'Assertion|FATAL' | ForEach-Object {
++        Write-Host "FAIL  $($_.Line)" -ForegroundColor Red
++    }
++    Stop-Sealgram
++}
++
++function Invoke-Installer {
++    if (-not (Test-Path $ISCC)) { Write-Host "no ISCC at $ISCC" -ForegroundColor Red; return }
++    & $ISCC "/DReleasePath=$Release" "$Root\Telegram\build\sealgram_setup.iss" |
++        Select-Object -Last 4
++    $setup = Get-ChildItem $Release -Filter 'sealgram-setup-*.exe' |
++        Sort-Object LastWriteTime -Descending | Select-Object -First 1
++    if ($setup) {
++        Write-Host ("{0}  {1} MB" -f $setup.Name, [math]::Round($setup.Length / 1MB, 1)) -ForegroundColor Green
++        Write-Host "SHA-256: $((Get-FileHash $setup.FullName -Algorithm SHA256).Hash)"
++    }
++}
++
++switch ($Command) {
++    'build'     { Invoke-Build }
++    'run'       { Invoke-Run }
++    'log'       { Invoke-Log }
++    'check'     { Test-Build }
++    'smoke'     { Invoke-Smoke }
++    'installer' { Invoke-Installer }
++    'refresh'   { Invoke-Refresh }
++}
+-- 
+2.54.0.windows.1
+
