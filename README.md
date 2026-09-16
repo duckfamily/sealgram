@@ -1,99 +1,224 @@
+<div align="center">
+
+<img src="assets/logo.svg" width="120" alt="Sealgram">
+
 # Sealgram
 
-A fork of [Telegram Desktop](https://github.com/telegramdesktop/tdesktop) for
-Windows, built for two reasons:
+**Telegram для Windows, который подключается сам — без VPN и ручной возни с прокси**
 
-1. **A stealer that copies the `tdata` folder should not be able to use the
-   account elsewhere.** Upstream derives the local encryption key from a salt
-   stored in plaintext next to the data, with a single PBKDF2 iteration when no
-   local passcode is set — copying the folder is enough to read everything. This
-   fork mixes in a seed produced inside the machine's TPM by a key that cannot be
-   exported.
-2. **It has to connect from a country where Telegram is blocked.** The client
-   fetches a signed list of MTProto proxies over ordinary HTTPS from a host that
-   stays reachable, measures them, and switches on its own when nothing connects
-   — or when messages arrive but media does not.
+[![Последняя версия](https://img.shields.io/github/v/release/duckfamily/sealgram?style=for-the-badge&label=%D0%B2%D0%B5%D1%80%D1%81%D0%B8%D1%8F&color=6D4AFF)](https://github.com/duckfamily/sealgram/releases/latest)
+[![Скачивания](https://img.shields.io/github/downloads/duckfamily/sealgram/total?style=for-the-badge&label=%D1%81%D0%BA%D0%B0%D1%87%D0%B8%D0%B2%D0%B0%D0%BD%D0%B8%D1%8F&color=6D4AFF)](https://github.com/duckfamily/sealgram/releases)
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-6D4AFF?style=for-the-badge&logo=windows&logoColor=white)](#-установка)
+[![Канал](https://img.shields.io/badge/Telegram-@SealgramTPM-6D4AFF?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/SealgramTPM)
 
-## Be precise about what the sealing does
+### [⬇️ Скачать для Windows](https://github.com/duckfamily/sealgram/releases/latest)
 
-It stops the data being **moved to another machine**. It does **not** stop a
-process running as the same user on the same machine: the TPM key has no PIN and
-no user-presence requirement, so anything running as that user can ask for the
-same seed.
+</div>
 
-Setting a local passcode closes that gap — the derivation then runs 100 000
-PBKDF2 iterations *and* mixes the TPM seed, so an attacker needs both the machine
-and something you know. It is worth setting.
+---
 
-## Licence
+## ✨ Возможности
 
-GPLv3, like the code it is based on. `LICENSE` is included.
+<table>
+<tr>
+<td width="50%" valign="top">
 
-The changes are supplied as a patch series against an exact upstream commit
-rather than as a full copy of the tree, because the tree plus its dependencies is
-several gigabytes and almost none of it is ours. This is the corresponding source
-for the binaries published under Releases.
+### 🌐 Работает без VPN
+Сам находит рабочие MTProto-прокси, замеряет их и выбирает самый быстрый.
+Если прокси умирает или перестают грузиться фото и видео — тихо
+переключается на другой. Ничего настраивать не нужно.
 
-## Building
+</td>
+<td width="50%" valign="top">
 
-```
+### 🔒 Сессию не унести копированием
+Ключ локальных данных привязан к TPM-чипу компьютера. Если скопировать
+папку `tdata` на другой компьютер, она там не откроется.
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### 👻 Режим призрака
+Не отправлять отметки о прочтении, просмотры историй, статус «в сети»
+и «печатает». Каждый пункт включается отдельно.
+
+</td>
+<td width="50%" valign="top">
+
+### 🚫 Без рекламы
+Спонсорские сообщения в каналах и продвигаемые результаты в поиске
+скрываются.
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### 🎞️ Живые обои
+Картинка, GIF или видео за чатами и списком диалогов — одним сплошным
+фоном.
+
+</td>
+<td width="50%" valign="top">
+
+### 📶 Панель соединения
+Какой прокси сейчас работает, пинг остальных и история переключений:
+видно, что происходит со связью.
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### 📥 Очередь загрузок
+Файлы качаются по несколько штук, докачиваются после обрыва связи,
+а очередь переживает перезапуск.
+
+</td>
+<td width="50%" valign="top">
+
+### 🔄 Обновления внутри клиента
+Новая версия скачивается прямо из приложения и перед установкой
+сверяется с подписанным манифестом.
+
+</td>
+</tr>
+</table>
+
+> 💡 Sealgram ставится **рядом** с официальным Telegram Desktop и ничего в нём не
+> трогает. Можно держать оба.
+
+---
+
+## 📦 Установка
+
+1. Скачай `sealgram-setup-*.exe` со страницы [последнего релиза](https://github.com/duckfamily/sealgram/releases/latest).
+2. Запусти. Права администратора не нужны — клиент ставится только для твоего
+   пользователя.
+3. Войди в аккаунт. Прокси подключится сам ещё на экране входа.
+
+> ⚠️ **Windows покажет предупреждение SmartScreen** — у установщика нет
+> платной цифровой подписи. Нажми **«Подробнее» → «Выполнить в любом случае»**.
+
+> 🛟 Если клиент совсем не запускается, в меню «Пуск» есть ярлык
+> **Sealgram (compatibility mode)**. Он отключает часть защиты процесса,
+> которая изредка конфликтует со сторонними программами.
+
+**Требования:** Windows 10 или 11, 64-бит. TPM 2.0 желателен: без него клиент
+работает, но данные не привязываются к компьютеру.
+
+---
+
+## ❓ Вопросы
+
+<details>
+<summary><b>Это официальный Telegram?</b></summary>
+<br>
+
+Нет. Это неофициальный форк Telegram Desktop, который поддерживает один человек.
+Он работает в обычной сети Telegram с твоим обычным аккаунтом, но Telegram его
+не выпускал и не проверял.
+
+</details>
+
+<details>
+<summary><b>Прокси могут читать мои сообщения?</b></summary>
+<br>
+
+Нет. MTProto-прокси только пересылает зашифрованный трафик между тобой и
+серверами Telegram, расшифровать его он не может. Видит он только твой IP-адрес
+и сам факт подключения.
+
+Список прокси подписан, и клиент проверяет подпись: подсунуть ему свои прокси
+посторонний не сможет.
+
+</details>
+
+<details>
+<summary><b>От чего именно защищает привязка к TPM?</b></summary>
+<br>
+
+От того, что папку `tdata` **унесут на другой компьютер** — например, стилер
+скопирует её и попробует зайти в твой аккаунт у себя. Там она не откроется.
+
+От программы, которая запущена **на этом же компьютере под твоим пользователем**,
+привязка сама по себе не спасает. Эту дыру закрывает **локальный код-пароль**:
+*Настройки → Конфиденциальность → Код-пароль*. С ним злоумышленнику нужны и твой
+компьютер, и пароль, который знаешь только ты. Поставить его стоит.
+
+</details>
+
+<details>
+<summary><b>Где следить за новостями?</b></summary>
+<br>
+
+В канале [@SealgramTPM](https://t.me/SealgramTPM) — там выходят обновления
+и объявления.
+
+</details>
+
+---
+
+<details>
+<summary><b>🛠️ Для разработчиков — исходники, сборка и что меняют патчи</b></summary>
+
+### Исходный код
+
+Лицензия GPLv3, как у Telegram Desktop, на котором основан форк. Изменения
+лежат серией патчей в [`patches/`](patches) к конкретному коммиту апстрима,
+а не копией всего дерева: дерево с зависимостями весит несколько гигабайт,
+и почти всё в нём не наше. Полный соответствующий исходник каждой сборки
+приложен к её [релизу](https://github.com/duckfamily/sealgram/releases).
+
+### Сборка
+
+```bash
 git clone --recursive https://github.com/telegramdesktop/tdesktop.git
 cd tdesktop
 git checkout 12e8d4a
 git am /path/to/patches/*.patch
 ```
 
-Then follow upstream's `docs/building-win-x64.md`, with two differences:
+Дальше по апстримной инструкции `docs/building-win-x64.md`, с двумя отличиями:
 
-- Configure with `-DDESKTOP_APP_DISABLE_AUTOUPDATE=ON`. Upstream's updater
-  fetches official Telegram Desktop packages, which would replace the binary with
-  one that has none of the changes below.
-- Build with `--config Release -- /m:1 /p:CL_MPCount=3`. Full MSBuild parallelism
-  combined with per-project `/MP` exhausts the compiler's heap and fails with
-  C1076, which reads like a broken source change and is actually the machine
-  running out of memory.
+- **`-DDESKTOP_APP_DISABLE_AUTOUPDATE=ON`** при конфигурации. Апстримный
+  апдейтер качает официальные сборки Telegram Desktop и заменил бы бинарник
+  версией без всех этих изменений.
+- **`--config Release -- /m:1 /p:CL_MPCount=3`** при сборке. Полная
+  параллельность MSBuild вместе с `/MP` исчерпывает память компилятора и падает
+  с `C1076` — выглядит как сломанный код, хотя на деле кончилась память.
 
-You will need your own `api_id` and `api_hash` from <https://my.telegram.org>,
-passed as `-DTDESKTOP_API_ID=` and `-DTDESKTOP_API_HASH=`. They are not in this
-repository.
+Нужны собственные `api_id` и `api_hash` с <https://my.telegram.org>, передаются
+как `-DTDESKTOP_API_ID=` и `-DTDESKTOP_API_HASH=`. В репозитории их нет.
 
-`SEALGRAM.md` documents the parts of the tree that look like obvious cleanups and
-are not — renaming the TPM key orphans every sealed profile, re-enabling
-autoupdate replaces the binary with stock Telegram Desktop, and Qt's AUTORCC does
-not notice when a file listed in a `.qrc` changes content.
+**Перед любыми правками прочитай [`SEALGRAM.md`](SEALGRAM.md).** Там описано,
+что в дереве выглядит как очевидная чистка, но ею не является: переименование
+TPM-ключа навсегда делает нечитаемыми все запечатанные профили, включение
+автообновления заменяет бинарник обычным Telegram Desktop, а Qt AUTORCC не
+замечает изменений в файлах, перечисленных в `.qrc`.
 
-## What the patches change
+### Что меняют патчи
 
-- **TPM sealing** — `storage/details/storage_tpm_seal.*` derives key material
-  from a non-exportable RSA key in the CNG platform provider. Deterministic
-  PKCS#1 v1.5 padding is used deliberately: the same input must always give the
-  same signature for the result to be key material rather than a yes/no answer.
-  A fallback re-seals data written before the machine had a usable TPM, so
-  gaining one does not lock anybody out of their own history.
-- **Process hardening** — extension-point disable, image load restrictions, heap
-  termination on corruption, Arbitrary Code Guard and Code Integrity Guard,
-  applied before anything else runs. `TDESKTOP_ACG=0` and `TDESKTOP_CIG=0` are
-  escape hatches. CIG needs no code signing certificate: it governs images loaded
-  *after* the policy is applied, and the executable is already mapped by then.
-- **Auth keys in memory** — pages locked against paging, wiped with
-  `OPENSSL_cleanse` because the compiler may elide a write never read again.
-- **Signed proxy feed** — an Ed25519-verified list fetched over plain HTTPS,
-  because a client that cannot reach Telegram cannot read a Telegram channel to
-  find a proxy. Entries expire after a day.
-- **Media-aware rotation** — a proxy can carry the main datacentre while refusing
-  the file datacentres, so messages arrive and photos never load. Ordinary
-  rotation cannot see that; this watches stalled download sessions instead.
-- **Ghost mode, spy mode, ad removal** — behaviour inspired by AyuGram Desktop
-  6.7.8. No code was copied; preserve both projects' GPL attribution.
-- **Custom wallpapers** — images, GIFs and video behind the chat and chat list.
-- **Renaming** — application name, data folder, single-instance GUID, `AppId`,
-  AppUserModelId and URL scheme keys are all distinct from Telegram Desktop's, so
-  both can be installed at once without fighting over them. Strings that name the
-  *service* — Telegram Premium, Telegram FAQ, Telegram API — are deliberately
-  untouched. This is still Telegram's network.
+| Изменение | Суть |
+|---|---|
+| **Привязка к TPM** | `storage/details/storage_tpm_seal.*` получает ключевой материал от неэкспортируемого RSA-ключа в CNG Platform Crypto Provider. Детерминированный PKCS#1 v1.5 выбран намеренно: одинаковый вход должен давать одинаковую подпись. Данные, записанные до появления TPM, перезапечатываются автоматически. |
+| **Защита процесса** | Запрет точек расширения, ограничения загрузки образов, завершение при порче кучи, ACG и CIG — раньше всего остального. Отключаются через `TDESKTOP_ACG=0` и `TDESKTOP_CIG=0`. CIG не требует сертификата: политика действует на образы, загруженные *после* её применения. |
+| **Ключи в памяти** | Страницы с auth-ключами закреплены от выгрузки на диск и затираются `OPENSSL_cleanse`. |
+| **Подписанный фид прокси** | Список с подписью Ed25519, загружаемый по обычному HTTPS: клиент, который не достучался до Telegram, не может прочитать Telegram-канал с прокси. Записи истекают через сутки. |
+| **Ротация прокси** | Смена при зависании основного соединения и отдельно — при зависании загрузок: прокси может пропускать сообщения и резать медиа. |
+| **Режим призрака, без рекламы** | Поведение вдохновлено AyuGram Desktop 6.7.8. Код не копировался; сохраняйте GPL-атрибуцию обоих проектов. |
+| **Обои** | Изображения, GIF и видео за чатом и списком диалогов. |
+| **Переименование** | Имя, папка данных, GUID единственного экземпляра, `AppId`, AppUserModelId и схема URL — свои, чтобы форк не конфликтовал с Telegram Desktop. Строки, называющие *сервис* (Telegram Premium, Telegram API), не тронуты: это по-прежнему сеть Telegram. |
 
-## Not affiliated with Telegram
+</details>
 
-This is an unofficial fork maintained by one person. It is not endorsed by or
-connected with Telegram FZ-LLC. Binaries here are unsigned, so Windows SmartScreen
-will warn on first run.
+---
+
+<div align="center">
+<sub>
+Неофициальный форк. Не связан с Telegram FZ-LLC и не одобрен ею.<br>
+Основан на <a href="https://github.com/telegramdesktop/tdesktop">Telegram Desktop</a> · Лицензия <a href="LICENSE">GPLv3</a>
+</sub>
+</div>

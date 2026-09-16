@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg">
+  <title>Sealgram</title>
+  <defs>
+    <linearGradient id="sealgram-gradient" x1="76" y1="76" x2="948" y2="948" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5B4BE8"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+  </defs>
+  <circle cx="512" cy="512" r="436" fill="url(#sealgram-gradient)"/>
+  <path fill="#FFFFFF" fill-rule="evenodd" d="M 247 434 C 226 426 224 397 244 386 L 769 244 C 792 238 811 259 804 282 L 666 752 C 658 778 626 787 607 766 L 441 576 L 286 463 C 269 451 261 443 247 434 Z M 307 430 L 588 500 C 610 505 621 517 628 538 L 668 690 L 457 550 Z"/>
+</svg>
