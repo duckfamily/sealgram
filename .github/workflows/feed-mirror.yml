@@ -1,0 +1,53 @@
+name: Mirror signed feeds
+
+# Keeps the `feed` branch holding the latest signed proxy list and update
+# manifests, so clients that cannot reach Vercel still get them from
+# raw.githubusercontent.com or jsDelivr. See .github/feed-mirror/mirror.mjs.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feed-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Start from the current feed branch, if any
+        run: |
+          mkdir -p feed
+          if git ls-remote --exit-code origin feed >/dev/null; then
+            git fetch --depth 1 origin feed
+            git --work-tree=feed checkout origin/feed -- .
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fetch and verify
+        run: node .github/feed-mirror/mirror.mjs feed
+
+      # One commit, force-pushed: the branch is a file host, not a history.
+      - name: Publish
+        run: |
+          cd feed
+          rm -rf .git
+          git init -q -b feed
+          git config user.name "github-actions[bot]"
+          git config user.email "41898333+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Signed feeds as of $(date -u +%FT%TZ)"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" feed
