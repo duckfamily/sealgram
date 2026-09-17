@@ -4,14 +4,14 @@
 
 # Sealgram
 
-**Telegram для Windows, который подключается сам — без VPN и ручной возни с прокси**
+**Telegram для Windows и Android, который подключается сам — без VPN и ручной возни с прокси**
 
-[![Последняя версия](https://img.shields.io/github/v/release/duckfamily/sealgram?style=for-the-badge&label=%D0%B2%D0%B5%D1%80%D1%81%D0%B8%D1%8F&color=6D4AFF)](https://github.com/duckfamily/sealgram/releases/latest)
 [![Скачивания](https://img.shields.io/github/downloads/duckfamily/sealgram/total?style=for-the-badge&label=%D1%81%D0%BA%D0%B0%D1%87%D0%B8%D0%B2%D0%B0%D0%BD%D0%B8%D1%8F&color=6D4AFF)](https://github.com/duckfamily/sealgram/releases)
-[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-6D4AFF?style=for-the-badge&logo=windows&logoColor=white)](#-установка)
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-6D4AFF?style=for-the-badge&logo=windows&logoColor=white)](#-windows)
+[![Android](https://img.shields.io/badge/Android-5.0%2B-6D4AFF?style=for-the-badge&logo=android&logoColor=white)](#-android)
 [![Канал](https://img.shields.io/badge/Telegram-@SealgramTPM-6D4AFF?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/SealgramTPM)
 
-### [⬇️ Скачать для Windows](https://github.com/duckfamily/sealgram/releases/latest)
+### [⬇️ Windows](https://github.com/duckfamily/sealgram/releases/latest) &nbsp;·&nbsp; [⬇️ Android](https://github.com/duckfamily/sealgram/releases/tag/android-v1.0.1)
 
 </div>
 
@@ -24,6 +24,8 @@
 <td width="50%" valign="top">
 
 ### 🌐 Работает без VPN
+<sub>🪟 Windows · 🤖 Android</sub>
+
 Сам находит рабочие MTProto-прокси, замеряет их и выбирает самый быстрый.
 Если прокси умирает или перестают грузиться фото и видео — тихо
 переключается на другой. Ничего настраивать не нужно.
@@ -32,6 +34,8 @@
 <td width="50%" valign="top">
 
 ### 🔒 Сессию не унести копированием
+<sub>🪟 Windows</sub>
+
 Ключ локальных данных привязан к TPM-чипу компьютера. Если скопировать
 папку `tdata` на другой компьютер, она там не откроется.
 
@@ -41,6 +45,8 @@
 <td width="50%" valign="top">
 
 ### 👻 Режим призрака
+<sub>🪟 Windows · 🤖 Android</sub>
+
 Не отправлять отметки о прочтении, просмотры историй, статус «в сети»
 и «печатает». Каждый пункт включается отдельно.
 
@@ -48,8 +54,10 @@
 <td width="50%" valign="top">
 
 ### 🚫 Без рекламы
+<sub>🪟 Windows · 🤖 Android</sub>
+
 Спонсорские сообщения в каналах и продвигаемые результаты в поиске
-скрываются.
+скрываются. На Android — ещё и «спонсор прокси» в списке чатов.
 
 </td>
 </tr>
@@ -57,6 +65,8 @@
 <td width="50%" valign="top">
 
 ### 🎞️ Живые обои
+<sub>🪟 Windows</sub>
+
 Картинка, GIF или видео за чатами и списком диалогов — одним сплошным
 фоном.
 
@@ -64,6 +74,8 @@
 <td width="50%" valign="top">
 
 ### 📶 Панель соединения
+<sub>🪟 Windows</sub>
+
 Какой прокси сейчас работает, пинг остальных и история переключений:
 видно, что происходит со связью.
 
@@ -73,6 +85,8 @@
 <td width="50%" valign="top">
 
 ### 📥 Очередь загрузок
+<sub>🪟 Windows</sub>
+
 Файлы качаются по несколько штук, докачиваются после обрыва связи,
 а очередь переживает перезапуск.
 
@@ -80,6 +94,8 @@
 <td width="50%" valign="top">
 
 ### 🔄 Обновления внутри клиента
+<sub>🪟 Windows · 🤖 Android</sub>
+
 Новая версия скачивается прямо из приложения и перед установкой
 сверяется с подписанным манифестом.
 
@@ -87,12 +103,14 @@
 </tr>
 </table>
 
-> 💡 Sealgram ставится **рядом** с официальным Telegram Desktop и ничего в нём не
-> трогает. Можно держать оба.
+> 💡 Sealgram ставится **рядом** с официальным Telegram — и на компьютере, и на телефоне —
+> и ничего в нём не трогает. Можно держать оба.
 
 ---
 
 ## 📦 Установка
+
+### 🪟 Windows
 
 1. Скачай `sealgram-setup-*.exe` со страницы [последнего релиза](https://github.com/duckfamily/sealgram/releases/latest).
 2. Запусти. Права администратора не нужны — клиент ставится только для твоего
@@ -109,6 +127,19 @@
 **Требования:** Windows 10 или 11, 64-бит. TPM 2.0 желателен: без него клиент
 работает, но данные не привязываются к компьютеру.
 
+### 🤖 Android
+
+1. Скачай `Sealgram-*.apk` со страницы [Android-релиза](https://github.com/duckfamily/sealgram/releases/tag/android-v1.0.1).
+2. Открой файл и разреши установку из неизвестных источников.
+3. Войди в аккаунт. Прокси подключится сам, как и на компьютере.
+
+> ⚠️ **Play Protect может предупредить**, что приложение неизвестно — его нет
+> в Google Play. Нажми **«Подробнее» → «Всё равно установить»**.
+
+Новые версии приходят прямо в приложении: *Настройки → Sealgram → Обновления*.
+
+**Требования:** Android 5.0 и новее.
+
 ---
 
 ## ❓ Вопросы
@@ -117,7 +148,8 @@
 <summary><b>Это официальный Telegram?</b></summary>
 <br>
 
-Нет. Это неофициальный форк Telegram Desktop, который поддерживает один человек.
+Нет. Это неофициальный форк Telegram Desktop и Telegram для Android, который
+поддерживает один человек.
 Он работает в обычной сети Telegram с твоим обычным аккаунтом, но Telegram его
 не выпускал и не проверял.
 
@@ -172,7 +204,12 @@
 и почти всё в нём не наше. Полный соответствующий исходник каждой сборки
 приложен к её [релизу](https://github.com/duckfamily/sealgram/releases).
 
-### Сборка
+**Android** основан на Telegram для Android (GPLv2). Исходник каждой сборки —
+архив `sealgram-android-source-*.tar.gz` в её Android-релизе: патч к конкретному
+коммиту [DrKLO/Telegram](https://github.com/DrKLO/Telegram) и инструкция по
+сборке внутри.
+
+### Сборка (Windows)
 
 ```bash
 git clone --recursive https://github.com/telegramdesktop/tdesktop.git
@@ -199,7 +236,7 @@ TPM-ключа навсегда делает нечитаемыми все за�
 автообновления заменяет бинарник обычным Telegram Desktop, а Qt AUTORCC не
 замечает изменений в файлах, перечисленных в `.qrc`.
 
-### Что меняют патчи
+### Что меняют патчи (Windows)
 
 | Изменение | Суть |
 |---|---|
@@ -219,6 +256,6 @@ TPM-ключа навсегда делает нечитаемыми все за�
 <div align="center">
 <sub>
 Неофициальный форк. Не связан с Telegram FZ-LLC и не одобрен ею.<br>
-Основан на <a href="https://github.com/telegramdesktop/tdesktop">Telegram Desktop</a> · Лицензия <a href="LICENSE">GPLv3</a>
+Основан на <a href="https://github.com/telegramdesktop/tdesktop">Telegram Desktop</a> (GPLv3) и <a href="https://github.com/DrKLO/Telegram">Telegram для Android</a> (GPLv2)
 </sub>
 </div>
